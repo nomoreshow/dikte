@@ -652,6 +652,7 @@ class ReadyToRun(DikteTest):
         # A machine Dikte is actually installed on would otherwise answer for
         # the "missing program" below through the real install record.
         self.patch_attr(ggml, "BIN_DIR", self.path("bin"))
+        self.patch_attr(ggml, "_macos_homebrew_program", lambda program: "")
 
     def install(self, name):
         path = ggml.whisper_model_path(name)

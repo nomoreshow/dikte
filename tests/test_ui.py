@@ -1313,6 +1313,8 @@ class LocalModels(DikteTest):
         # "nothing can transcribe" question from its real binary and model.
         self.patch_attr(ggml, "BIN_DIR", self.path("bin"))
         self.patch_attr(ggml, "MODELS_DIR", self.path("models"))
+        self.patch_attr(ggml, "_macos_homebrew_program", lambda program: "")
+        self.enterContext(mock.patch.object(ggml.shutil, "which", return_value=None))
         # And one with Codex on it would ask it for its model list.
         self.enterContext(mock.patch.object(settings_ui.SettingsWindow,
                                             "_load_codex_models"))

@@ -531,6 +531,24 @@ def vulkan_missing(program):
             and _read_record(program).get("backend") == "processor")
 
 
+def _macos_homebrew_program(program):
+    """Find Homebrew whisper-server outside a shell PATH."""
+    if sys.platform != "darwin" or program is not WHISPER:
+        return ""
+    arch = platform.machine().lower()
+    if arch in ("arm64", "aarch64"):
+        prefix = "/opt/homebrew"
+    elif arch in ("x86_64", "amd64"):
+        prefix = "/usr/local"
+    else:
+        return ""
+    candidate = os.path.join(
+        prefix, "opt", "whisper-cpp", "bin", program.binary,
+    )
+    return (candidate if os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK) else "")
+
+
 def program_path(program, custom=""):
     """Which copy of the program to run, or "" when there is none.
 
@@ -541,12 +559,13 @@ def program_path(program, custom=""):
     custom = (custom or "").strip()
     if custom:
         return custom if os.path.isfile(custom) and os.access(custom, os.X_OK) else ""
-    return shutil.which(program.binary) or installed_program(program)
+    return (shutil.which(program.binary) or _macos_homebrew_program(program)
+            or installed_program(program))
 
 
 def system_program(program):
     """Whether the program came from the system rather than from Dikte."""
-    return bool(shutil.which(program.binary))
+    return bool(shutil.which(program.binary) or _macos_homebrew_program(program))
 
 
 def _binary_file(program):
@@ -614,16 +633,14 @@ def install_program(program, tag="", on_progress=None, should_stop=None,
 
     if item is None:
         # Nothing to download and nothing to install for you: whisper.cpp
-        # publishes no macOS binary, and Homebrew's whisper-cpp is configured
-        # with WHISPER_BUILD_SERVER=OFF, so it is whisper-cli that lands and not
-        # the server Dikte talks to. Building it is a cmake line, and the
-        # binary is picked up from the PATH or from the box above, the same way
-        # a distribution's own build is on Linux.
+        # publishes no macOS server archive. Homebrew's whisper-cpp formula
+        # provides whisper-server, which program_path finds through PATH or its
+        # stable opt path. A hand-built binary can still be selected explicitly.
         if sys.platform == "darwin" and program is WHISPER:
             raise LocalError(t(
-                "whisper.cpp has no macOS build, and Homebrew's leaves out the "
-                "server. Build whisper-server yourself and give its path here, "
-                "or transcribe in the cloud. See the README."
+                "whisper.cpp has no downloadable macOS server. Install "
+                "Homebrew's with `brew install whisper-cpp`, give the path to "
+                "another whisper-server here, or transcribe in the cloud."
             ))
         raise LocalError(t("{repo} {tag} has no build for this machine.",
                            repo=program.repo, tag=tag))

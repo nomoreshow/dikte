@@ -415,7 +415,7 @@ class InstallProgram(Local):
         with fake_urlopen(listing):
             with self.assertRaises(ggml.LocalError) as caught:
                 ggml.install_program(ggml.WHISPER)
-        self.assertIn("Build whisper-server yourself", str(caught.exception))
+        self.assertIn("brew install whisper-cpp", str(caught.exception))
 
     def test_a_mac_uses_the_native_llama_archive_instead_of_ubuntu(self):
         self.patch_attr(sys, "platform", "darwin")
@@ -501,7 +501,8 @@ class InstallProgram(Local):
         # the replacement is unpacked next door and known to be whole.
         self.install("whisper-bin-ubuntu-x64.tar.gz")
         server = self.StubServer()
-        with mock.patch.object(ggml, "SERVERS", (server,)):
+        with mock.patch.object(ggml.shutil, "which", return_value=None), \
+                mock.patch.object(ggml, "SERVERS", (server,)):
             self.install("whisper-bin-ubuntu-x64.tar.gz")
         self.assertEqual(server.stops, 1)
         self.assertTrue(server.new_version_was_ready)
@@ -580,6 +581,39 @@ class InstallProgram(Local):
 
 
 class WhichCopyRuns(Local):
+    def test_apple_silicon_macos_finds_homebrew_outside_the_shell_path(self):
+        expected = "/opt/homebrew/opt/whisper-cpp/bin/whisper-server"
+        self.patch_attr(sys, "platform", "darwin")
+        self.patch_attr(ggml.platform, "machine", lambda: "arm64")
+        with mock.patch.dict(os.environ, {"HOMEBREW_PREFIX": ""}):
+            with mock.patch("shutil.which", return_value=None):
+                with mock.patch("os.path.isfile",
+                                side_effect=lambda path: str(path) == expected):
+                    with mock.patch("os.access", return_value=True):
+                        self.assertEqual(ggml.program_path(ggml.WHISPER), expected)
+
+    def test_intel_macos_finds_homebrew_outside_the_shell_path(self):
+        expected = "/usr/local/opt/whisper-cpp/bin/whisper-server"
+        self.patch_attr(sys, "platform", "darwin")
+        self.patch_attr(ggml.platform, "machine", lambda: "x86_64")
+        with mock.patch.dict(os.environ, {"HOMEBREW_PREFIX": ""}):
+            with mock.patch("shutil.which", return_value=None):
+                with mock.patch("os.path.isfile",
+                                side_effect=lambda path: str(path) == expected):
+                    with mock.patch("os.access", return_value=True):
+                        self.assertEqual(ggml.program_path(ggml.WHISPER), expected)
+
+    def test_homebrew_whisper_is_reported_as_a_system_program(self):
+        expected = "/opt/homebrew/opt/whisper-cpp/bin/whisper-server"
+        self.patch_attr(sys, "platform", "darwin")
+        self.patch_attr(ggml.platform, "machine", lambda: "arm64")
+        with mock.patch.dict(os.environ, {"HOMEBREW_PREFIX": ""}):
+            with mock.patch("shutil.which", return_value=None):
+                with mock.patch("os.path.isfile",
+                                side_effect=lambda path: str(path) == expected):
+                    with mock.patch("os.access", return_value=True):
+                        self.assertTrue(ggml.system_program(ggml.WHISPER))
+
     def test_a_system_build_wins_over_a_downloaded_one(self):
         self.patch_attr(ggml, "installed_program", lambda program: "/data/whisper-server")
         with mock.patch("shutil.which", return_value="/usr/bin/whisper-server"):
@@ -587,6 +621,7 @@ class WhichCopyRuns(Local):
 
     def test_the_downloaded_one_is_used_when_there_is_no_system_build(self):
         self.patch_attr(ggml, "installed_program", lambda program: "/data/whisper-server")
+        self.patch_attr(ggml, "_macos_homebrew_program", lambda program: "")
         with mock.patch("shutil.which", return_value=None):
             self.assertEqual(ggml.program_path(ggml.WHISPER), "/data/whisper-server")
 
@@ -1198,6 +1233,7 @@ class Arguments(Local):
         self.assertIn("Settings", str(caught.exception))
 
     def test_a_missing_program_says_so_before_a_missing_model(self):
+        self.patch_attr(ggml, "_macos_homebrew_program", lambda program: "")
         with mock.patch("shutil.which", return_value=None):
             with self.assertRaises(ggml.LocalError) as caught:
                 ggml._whisper_args({"binary": "", "gpu": True, "threads": 0,
