@@ -36,7 +36,7 @@ if sys.platform == "darwin":
 
 from PyQt6.QtCore import (QObject, QTimer, QElapsedTimer, QSocketNotifier,  # noqa: E402
                           QUrl, pyqtSignal)
-from PyQt6.QtGui import QAction, QDesktopServices, QIcon  # noqa: E402
+from PyQt6.QtGui import QAction, QCursor, QDesktopServices, QIcon  # noqa: E402
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon  # noqa: E402
 
@@ -307,7 +307,12 @@ class Dikte:
         self.quit_action.triggered.connect(self.app.quit)
         self.menu.addAction(self.quit_action)
 
-        self.tray.setContextMenu(self.menu)
+        if _uses_native_tray_context_menu():
+            self.tray.setContextMenu(self.menu)
+        else:
+            # On macOS the native menu opens on the same press that emits
+            # Trigger, so one click both showed the menu and ran its action.
+            self.tray.setContextMenu(None)
         # A model unloads itself in the background, so what the unload row says
         # goes stale between state changes. Refreshed as the menu opens, which
         # is the only moment anybody reads it.
@@ -318,7 +323,14 @@ class Dikte:
         self._set_icon("audio-input-microphone")
 
     def _tray_clicked(self, reason):
+        if (sys.platform == "darwin"
+                and reason == QSystemTrayIcon.ActivationReason.Context):
+            self.menu.popup(QCursor.pos())
+            return
         if reason != QSystemTrayIcon.ActivationReason.Trigger:
+            return
+        if sys.platform == "darwin" and not self.recording:
+            self.open_settings()
             return
         # The icon ends whatever is being recorded rather than only a dictation.
         # The two shortcuts are each tied to their own mode, on purpose, but the
@@ -1408,6 +1420,11 @@ class Dikte:
 def _preview(text):
     line = text.replace("\n", " ")
     return line[:48] + ("…" if len(line) > 48 else "")
+
+
+def _uses_native_tray_context_menu(platform_name=None):
+    """Whether Qt should attach its automatic menu to the status item."""
+    return (platform_name or sys.platform) != "darwin"
 
 
 def _clock(seconds):
