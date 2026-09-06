@@ -877,7 +877,8 @@ def accelerator():
     is for is the other half, which nothing else on the window says at all.
     """
     if sys.platform == "darwin":
-        return "Metal"
+        return ("Metal" if platform.machine().lower() in ("arm64", "aarch64")
+                else "")
     return "Vulkan" if _has_vulkan() else ""
 
 

@@ -651,7 +651,9 @@ class WhichCopyRuns(Local):
         mine.write_text("#!/bin/sh\n")
         mine.chmod(0o755)
         with mock.patch("shutil.which", return_value="/usr/bin/whisper-server"):
-            self.assertEqual(ggml.program_path(ggml.WHISPER, str(mine)), str(mine))
+            self.assertEqual(
+                ggml.program_path(ggml.WHISPER, str(mine)), str(mine.resolve()),
+            )
 
     def test_a_relative_custom_program_becomes_its_canonical_absolute_path(self):
         target = self.path("work/whisper-server")
@@ -1666,9 +1668,18 @@ class Machine(Local):
                 mock.patch.object(sys, "platform", "linux"):
             self.assertEqual(ggml.total_memory(), 0)
 
-    def test_a_mac_is_taken_to_have_a_graphics_interface(self):
-        with mock.patch.object(sys, "platform", "darwin"):
+    def test_an_apple_silicon_mac_has_a_metal_interface(self):
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch.object(ggml.platform, "machine", return_value="arm64"):
             self.assertEqual(ggml.accelerator(), "Metal")
+
+    def test_an_intel_or_rosetta_mac_does_not_claim_metal(self):
+        for architecture in ("x86_64", "amd64"):
+            with self.subTest(architecture=architecture):
+                with mock.patch.object(sys, "platform", "darwin"), \
+                        mock.patch.object(ggml.platform, "machine",
+                                          return_value=architecture):
+                    self.assertEqual(ggml.accelerator(), "")
 
     def test_elsewhere_the_vulkan_loader_is_what_says_so(self):
         with mock.patch.object(sys, "platform", "linux"), \
