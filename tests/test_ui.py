@@ -22,6 +22,7 @@ from dikte import audio
 from dikte import cleanup
 from dikte import config as cfg
 from dikte import ggml
+from dikte import hardware
 from dikte import hotkey
 from dikte import hub
 from dikte import ipc
@@ -36,6 +37,9 @@ from tests.support import DikteTest, only_these_tools
 # in a test never calls anybody; taken here, before any test runs, so the two
 # tests about what it does when called still have the real one.
 REAL_LOAD_HOSTED_MODELS = settings_ui.SettingsWindow._load_hosted_models
+REAL_REFRESH_PROCESSING_DEVICES = (
+    settings_ui.SettingsWindow._refresh_processing_devices
+)
 
 # One application for the whole run; Qt allows no second one.
 _app = QApplication.instance() or QApplication([])
@@ -76,6 +80,7 @@ CHANGED = {
     "cleanup_reasoning": "high",
     "local_model": "ggml-small.bin",
     "local_gpu": False,
+    "local_device": "cpu",
     "local_preload": False,
     "local_threads": 6,
     "local_llm_model": "gemma-3-4b-it-Q4_K_M.gguf",
@@ -156,6 +161,9 @@ class Settings(DikteTest):
                                             "_load_agy_models"))
         self.enterContext(mock.patch.object(settings_ui.SettingsWindow,
                                             "_load_hosted_models"))
+        self.enterContext(mock.patch.object(
+            settings_ui.SettingsWindow, "_refresh_processing_devices"
+        ))
         # The local model boxes fetch their own list the moment they are shown,
         # from a thread, which is nobody's test failing but a real request.
         self.enterContext(mock.patch.object(settings_ui.LocalModelBox,
@@ -1322,6 +1330,9 @@ class LocalModels(DikteTest):
                                             "_load_agy_models"))
         self.enterContext(mock.patch.object(settings_ui.SettingsWindow,
                                             "_load_hosted_models"))
+        self.enterContext(mock.patch.object(
+            settings_ui.SettingsWindow, "_refresh_processing_devices"
+        ))
 
     def window(self, conf):
         window = settings_ui.SettingsWindow(conf)
@@ -1663,6 +1674,228 @@ class LocalModels(DikteTest):
             box._show_machine()
         self.assertIn("Vulkan", box.machine_label.text())
         self.assertIn("32.0 GB", box.machine_label.text())
+
+    def test_the_machine_summary_separates_selection_from_availability(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "AMD Radeon RX 6750 XT", 12 << 30, False, identifier, 0,
+        )
+        expected = {
+            "cpu": ("Selected processing: Processor (CPU)",
+                    "Available graphics: AMD Radeon RX 6750 XT"),
+            "auto": ("Selected processing: Automatic",
+                     "Available graphics: AMD Radeon RX 6750 XT"),
+            identifier: ("Selected processing: AMD Radeon RX 6750 XT (Vulkan)",
+                         "Dedicated graphics memory: 12.0 GB"),
+        }
+        box = self.window(cfg.Config()).local_whisper
+        with mock.patch.object(ggml, "total_memory", return_value=32 << 30):
+            for selection, phrases in expected.items():
+                with self.subTest(selection=selection):
+                    box._show_machine(selection, (device,))
+                    text = box.machine_label.text()
+                    self.assertIn(phrases[0], text)
+                    self.assertIn(phrases[1], text)
+                    self.assertIn("System memory: 32.0 GB", text)
+
+    def test_the_processing_device_loads_cpu_without_a_checkbox(self):
+        window = self.window(self.config(local_device="cpu", local_gpu=False))
+        self.assertIsInstance(window.local_device, settings_ui.QComboBox)
+        self.assertEqual(window.local_device.currentData(), "cpu")
+
+    def test_processing_device_discovery_does_not_run_on_the_ui_thread(self):
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                workers.append((target, daemon))
+
+            def start(self):
+                pass
+
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices",
+                REAL_REFRESH_PROCESSING_DEVICES
+        ), mock.patch.object(
+                settings_ui.threading, "Thread", DeferredThread
+        ), mock.patch.object(hardware, "graphics_devices") as inventory, \
+                mock.patch.object(ggml, "managed_vulkan_devices") as backend:
+            window = self.window(cfg.Config())
+        inventory.assert_not_called()
+        backend.assert_not_called()
+        self.assertTrue(workers)
+        self.assertTrue(workers[0][1])
+        self.assertEqual(
+            [window.local_device.itemData(row)
+             for row in range(window.local_device.count())],
+            ["auto", "cpu"],
+        )
+
+    def test_installing_the_managed_program_refreshes_device_choices(self):
+        refresh = mock.Mock()
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices", refresh
+        ):
+            window = self.window(cfg.Config())
+            refresh.reset_mock()
+            window.local_whisper.changed.emit()
+            refresh.assert_not_called()
+            window.local_whisper._on_installed("", "")
+        refresh.assert_called_once_with()
+
+    def test_an_old_device_probe_cannot_overwrite_a_newer_result(self):
+        old = hardware.GraphicsDevice(
+            "Old GPU", 4 << 30, False, "vulkan:old", 0
+        )
+        new = hardware.GraphicsDevice(
+            "New GPU", 12 << 30, False, "vulkan:new", 0
+        )
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                workers.append(target)
+
+            def start(self):
+                pass
+
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices",
+                REAL_REFRESH_PROCESSING_DEVICES
+        ), mock.patch.object(
+                settings_ui.threading, "Thread", DeferredThread
+        ), mock.patch.object(
+                hardware, "graphics_devices", side_effect=((new,), (old,))
+        ), mock.patch.object(
+                ggml, "managed_vulkan_devices", side_effect=((new,), (old,))
+        ):
+            window = self.window(cfg.Config())
+            workers.clear()
+            window._refresh_processing_devices()
+            window._refresh_processing_devices()
+            self.assertEqual(len(workers), 2)
+            workers[1]()
+            workers[0]()
+        labels = [
+            window.local_device.itemText(row)
+            for row in range(window.local_device.count())
+        ]
+        self.assertTrue(any("New GPU" in label for label in labels))
+        self.assertFalse(any("Old GPU" in label for label in labels))
+
+    def test_saving_the_processing_device_keeps_the_legacy_gpu_setting_compatible(self):
+        conf = self.config(local_device="auto", local_gpu=True)
+        window = self.window(conf)
+        window.local_device.setCurrentIndex(
+            window.local_device.findData("cpu")
+        )
+        with mock.patch.object(QMessageBox, "information"):
+            window._save()
+        self.assertEqual(conf["local_device"], "cpu")
+        self.assertFalse(conf["local_gpu"])
+
+    def test_changing_the_processing_device_updates_the_summary_immediately(self):
+        device = hardware.GraphicsDevice(
+            "AMD Radeon RX 6750 XT", 12 << 30, False,
+            "vulkan:00112233445566778899aabbccddeeff", 0,
+        )
+        with mock.patch.object(hardware, "graphics_devices", return_value=(device,)):
+            window = self.window(self.config(local_device="cpu", local_gpu=False))
+        self.assertIn("Selected processing: Processor (CPU)",
+                      window.local_whisper.machine_label.text())
+        window.local_device.setCurrentIndex(0)
+        self.assertIn("Selected processing: Automatic",
+                      window.local_whisper.machine_label.text())
+
+    def test_a_saved_card_that_is_gone_stays_selected_as_unavailable(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        window = self.window(self.config(local_device=identifier, local_gpu=True))
+        self.assertEqual(window.local_device.currentData(), identifier)
+        self.assertIn("unavailable", window.local_device.currentText())
+        self.assertIn("Graphics card unavailable",
+                      window.local_whisper.machine_label.text())
+
+    def test_background_device_result_replaces_the_unavailable_placeholder(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "AMD Radeon RX 6750 XT", 12 << 30, False, identifier, 0
+        )
+        with mock.patch.object(settings_ui.threading, "Thread"):
+            window = self.window(self.config(
+                local_device=identifier, local_gpu=True
+            ))
+        window._set_processing_devices((device,), (device,))
+        self.assertEqual(window.local_device.currentData(), identifier)
+        self.assertNotIn("unavailable", window.local_device.currentText())
+        self.assertIn("AMD Radeon RX 6750 XT", window.local_device.currentText())
+        self.assertIn("12.0 GB dedicated", window.local_device.currentText())
+
+    def test_an_unmapped_raw_card_is_not_reported_as_selected(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "Present but unmappable GPU", 12 << 30, False, identifier, None
+        )
+        with mock.patch.object(settings_ui.threading, "Thread"):
+            window = self.window(self.config(
+                local_device=identifier, local_gpu=True
+            ))
+        window._set_processing_devices((device,), ())
+        self.assertIn("unavailable", window.local_device.currentText())
+        self.assertIn("Selected processing: Graphics card unavailable",
+                      window.local_whisper.machine_label.text())
+        self.assertNotIn("Selected processing: Present but unmappable GPU",
+                         window.local_whisper.machine_label.text())
+
+    def test_a_managed_vulkan_card_is_an_explicit_processing_choice(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "AMD Radeon RX 6750 XT", 12 << 30, False, identifier, 0,
+        )
+        binary = self.path("bin/whisper/v1.9.3/whisper-server")
+        binary.parent.mkdir(parents=True)
+        binary.write_text("")
+        binary.chmod(0o755)
+        self.path("bin/whisper/installed.json").write_text(json.dumps({
+            "tag": "v1.9.3", "binary": str(binary), "backend": "vulkan",
+        }))
+        self.patch_attr(ggml.shutil, "which", lambda name: None)
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                workers.append(target)
+
+            def start(self):
+                pass
+
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices",
+                REAL_REFRESH_PROCESSING_DEVICES
+        ), mock.patch.object(
+                settings_ui.threading, "Thread", DeferredThread
+        ), mock.patch.object(
+                hardware, "graphics_devices", return_value=(device,)
+        ), mock.patch.object(
+                ggml, "managed_vulkan_devices", return_value=(device,)
+        ) as backend_probe:
+            window = self.window(self.config(local_device=identifier,
+                                             local_gpu=True))
+            backend_probe.assert_not_called()
+            self.assertTrue(workers)
+            workers[-1]()
+        backend_probe.assert_called_once_with(str(binary), (device,))
+        self.assertEqual(window.local_device.currentData(), identifier)
+        text = " ".join(window.local_device.itemText(row)
+                        for row in range(window.local_device.count()))
+        self.assertIn("AMD Radeon RX 6750 XT", text)
+        self.assertIn("12.0 GB dedicated", text)
+
+    def test_an_integrated_gpu_is_labelled_as_shared_memory(self):
+        device = hardware.GraphicsDevice(
+            "Intel UHD Graphics", 8 << 30, True, "vulkan:intel", 0,
+        )
+        self.assertIn("8.0 GB shared graphics memory",
+                      settings_ui._graphics_device_label(device))
 
     def test_a_machine_with_no_card_is_told_it_is_on_the_processor(self):
         box = self.window(cfg.Config()).local_whisper

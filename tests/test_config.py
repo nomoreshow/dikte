@@ -33,6 +33,12 @@ class Loading(DikteTest):
         self.write_config({"cleanup_model": "some/other-model"})
         self.assertEqual(cfg.Config()["cleanup_model"], "some/other-model")
 
+    def test_the_old_gpu_checkbox_migrates_to_a_processing_device(self):
+        for old_value, expected in ((True, "auto"), (False, "cpu")):
+            with self.subTest(local_gpu=old_value):
+                self.write_config({"local_gpu": old_value})
+                self.assertEqual(cfg.Config()["local_device"], expected)
+
     def test_a_key_this_version_does_not_have_is_dropped(self):
         """A setting from a fork, or from a version that removed it."""
         self.write_config({"cleanup_model": "kept", "invented_by_a_fork": True})
@@ -690,6 +696,23 @@ class ReadyToRun(DikteTest):
         self.assertEqual(ggml.whisper.settings()["threads"], 4)
         self.assertFalse(ggml.whisper.settings()["gpu"])
         self.assertEqual(ggml.llm.settings()["context"], 4096)
+
+    def test_the_processing_device_reaches_the_whisper_server(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        conf = self.config(local_device=identifier)
+        conf.apply_local()
+        self.addCleanup(ggml.whisper.configure, device="auto")
+        self.assertEqual(ggml.whisper.settings()["device"], identifier)
+
+    def test_the_processing_device_is_the_source_of_truth_over_the_old_checkbox(self):
+        for selection, old_gpu, expected_gpu in (
+                ("cpu", True, False),
+                ("vulkan:00112233445566778899aabbccddeeff", False, True)):
+            with self.subTest(selection=selection):
+                conf = self.config(local_device=selection, local_gpu=old_gpu)
+                conf.apply_local()
+                self.assertEqual(ggml.whisper.settings()["gpu"], expected_gpu)
+        self.addCleanup(ggml.whisper.configure, gpu=True, device="auto")
 
     def test_the_idle_window_is_in_seconds(self):
         conf = self.config(local_idle_unload=True, local_idle_minutes=15)
