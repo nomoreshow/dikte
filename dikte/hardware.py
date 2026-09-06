@@ -3,6 +3,7 @@
 import collections
 import ctypes
 import ctypes.util
+import os
 import sys
 
 
@@ -91,6 +92,15 @@ GraphicsDevice = collections.namedtuple(
     "GraphicsDevice", "name memory shared identifier backend_index",
     defaults=("", None),
 )
+
+
+def cpu_threads():
+    """Logical CPUs available to this process, with a portable fallback."""
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError, NotImplementedError):
+        available = os.cpu_count() or 1
+    return max(1, available)
 
 
 def graphics_devices():

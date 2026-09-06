@@ -2,6 +2,7 @@
 
 import functools
 import os
+import pathlib
 import shutil
 import sys
 import threading
@@ -12,7 +13,8 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from . import __version__
@@ -268,11 +270,10 @@ class LocalModelBox(QGroupBox):
     changed = pyqtSignal()
     program_changed = pyqtSignal()
 
-    def __init__(self, program, title, models, model_path, binary=None,
-                 repos=None, parent=None):
+    def __init__(self, program, title, models, model_path, repos=None, parent=None):
         super().__init__(title, parent)
         self.program = program
-        self._binary = binary          # () -> a path set by hand, or ""
+        self.custom_binary = ""  # UI draft; only Save writes the configuration.
         self._models = models          # () -> [hub.Item], or (repo) -> [hub.Item]
         self._model_path = model_path  # (name) -> Path
         self._repos = repos            # None, or () -> [repo id]
@@ -304,6 +305,10 @@ class LocalModelBox(QGroupBox):
         self.install_button.clicked.connect(self._install_program)
         form.addRow(t("Program"), self._side_by_side(self.program_label,
                                                      self.install_button))
+
+        self.automatic_button = QPushButton(t("Use automatic selection"))
+        self.automatic_button.clicked.connect(self._use_automatic_program)
+        form.addRow("", self.automatic_button)
 
         # What the model rows are judged against, said out loud. Without it,
         # "too big for this machine" and the recommendation above the list are
@@ -445,47 +450,49 @@ class LocalModelBox(QGroupBox):
                 self._fill_repos(self.repository())
             self._fetch_models(self.repository())
 
+    def _use_automatic_program(self):
+        self.custom_binary = ""
+        self._show_program()
+        self._refresh_buttons()
+        self.changed.emit()
+        self.program_changed.emit()
+
     def _program_path(self):
-        return ggml.program_path(self.program,
-                                 self._binary() if self._binary else "")
+        return ggml.program_path(self.program, self.custom_binary)
 
     def _show_program(self):
+        self.automatic_button.setVisible(bool(self.custom_binary))
         path = self._program_path()
+        installed = ggml.installed_program(self.program)
+        # Installed and selected are independent: a download never changes an
+        # explicit override, and automatic resolution still prefers PATH.
+        self.install_button.setText(t("Download again") if installed else t("Download"))
+        self.install_button.setVisible(bool(self.custom_binary)
+                                       or not ggml.system_program(self.program))
         if not path:
-            self.program_label.setText(t("Not installed."))
-            self.install_button.setText(t("Download"))
+            self.program_label.setText(
+                t("Custom program unavailable: {path}", path=self.custom_binary)
+                if self.custom_binary else t("Not installed."))
             self.install_button.setVisible(True)
             return
-        if self._binary and self._binary():
-            # Neither a system copy nor one Dikte fetched, and "Downloaded"
-            # over a build someone made themselves is not true.
-            self.program_label.setText(t("Using custom build: {path}", path=path))
-            self.install_button.setVisible(False)
-            return
-        # A copy that is here is not a copy that is right. whisper.cpp releases
-        # every few weeks, and a graphics card installed after Dikte was
-        # changes which build this machine should be running; the button was
-        # hidden the moment anything landed, and nothing else on this window
-        # asks for the download again.
-        self.install_button.setText(t("Download again")
-                                    if ggml.installed_program(self.program)
-                                    else t("Download"))
-        self.install_button.setVisible(not ggml.system_program(self.program))
-        if ggml.system_program(self.program):
-            # Worth saying which one is running: a distribution package is built
-            # for this machine and may reach the graphics card, while the
-            # released binaries carry processor backends only.
-            self.program_label.setText(t("Installed on the system: {path}", path=path))
+        managed = bool(installed and pathlib.Path(path).resolve()
+                       == pathlib.Path(installed).resolve())
+        if not managed:
+            self.program_label.setText(
+                t("Using custom build: {path}", path=path) if self.custom_binary else
+                t("Installed on the system: {path}", path=path))
         elif ggml.vulkan_missing(self.program):
             # The download landed the processor build where the graphics card
             # one belongs, and nothing else on this window would say so.
             self.program_label.setText(
-                t("Downloaded, version {version}. There was no Vulkan build, "
+                t("Downloaded: {name}, version {version}. There was no Vulkan build, "
                   "so this one runs on the processor.",
+                  name=self.program.repo.rsplit("/", 1)[-1],
                   version=ggml.installed_version(self.program) or "?"))
         else:
             self.program_label.setText(
-                t("Downloaded, version {version}.",
+                t("Downloaded: {name}, version {version}.",
+                  name=self.program.repo.rsplit("/", 1)[-1],
                   version=ggml.installed_version(self.program) or "?"))
 
     def _show_machine(self, selection=None, devices=(), selectable=None):
@@ -526,7 +533,7 @@ class LocalModelBox(QGroupBox):
                                 "available on the processor."))
         if memory:
             parts.append(t("System memory: {size}.", size=ggml.human_size(memory)))
-        self.machine_label.setText(" ".join(parts))
+        self.machine_label.setText("\n".join(parts))
 
     # ---- the lists -------------------------------------------------------
 
@@ -774,7 +781,9 @@ class LocalModelBox(QGroupBox):
         self.install_button.setEnabled(True)
         self._show_program()
         if error:
-            self.program_label.setText(error)
+            self.program_label.setText(
+                self.program_label.text() + "\n" +
+                t("Download failed: {error}", error=error))
         # The model line says whether the program is here, so installing one
         # changes what it should read.
         self._refresh_buttons()
@@ -1435,8 +1444,7 @@ class SettingsWindow(QDialog):
 
         self.local_whisper = LocalModelBox(
             ggml.WHISPER, t("On this machine"),
-            ggml.whisper_models, ggml.whisper_model_path,
-            binary=lambda: self.conf["local_binary"])
+            ggml.whisper_models, ggml.whisper_model_path)
         stt_form.addRow(self.local_whisper)
 
         self.local_device = QComboBox()
@@ -1458,13 +1466,18 @@ class SettingsWindow(QDialog):
               "spends that once instead of on the first dictation, at the cost of "
               "the memory it sits in."))
         self.local_threads = QSpinBox()
-        max_threads = max(1, os.cpu_count() or 1)
-        self.local_threads.setRange(0, max_threads)
+        self.local_threads.setRange(0, hardware.cpu_threads())
         self.local_threads.setSpecialValueText(t("Automatic"))
-        # A spin box asks for room for its numbers, and the word standing in for
-        # zero is what actually has to fit, and on macOS, where the stepper sits
-        # inside the frame, it does not. Widened to the word rather than to a
-        # number picked by eye, so that it still fits once the word is "Otomatik".
+        self.local_threads.setToolTip(t(
+            "CPU worker threads. This process can use up to {count} logical CPUs. "
+            "Automatic lets whisper.cpp choose. More threads are not always faster.",
+            count=self.local_threads.maximum(),
+        ))
+        # A spin box asks for room for its numbers:
+        # the word standing in for zero is what actually has to fit, and on
+        # macOS, where the stepper sits inside the frame, it does not. Widened
+        # to the word rather than to a number picked by eye, so that it still
+        # fits once the word is "Otomatik".
         self.local_threads.setMinimumWidth(
             self.local_threads.fontMetrics()
             .horizontalAdvance(t("Automatic")) + 56)
@@ -1473,7 +1486,20 @@ class SettingsWindow(QDialog):
         options_form.setContentsMargins(0, 0, 0, 0)
         options_form.addRow(t("Processing device"), self.local_device)
         options_form.addRow("", self.local_preload)
-        options_form.addRow(t("Threads"), self.local_threads)
+        self.local_advanced_toggle = QToolButton()
+        self.local_advanced_toggle.setText(t("Advanced"))
+        self.local_advanced_toggle.setCheckable(True)
+        self.local_advanced_toggle.setAutoRaise(True)
+        self.local_advanced_toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.local_advanced = QWidget()
+        advanced_form = QFormLayout(self.local_advanced)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.addRow(t("CPU threads"), self.local_threads)
+        options_form.addRow(self.local_advanced_toggle)
+        options_form.addRow(self.local_advanced)
+        self.local_advanced_toggle.toggled.connect(self._toggle_local_advanced)
+        self._toggle_local_advanced(False)
         stt_form.addRow(self.local_options)
         # What the model is actually doing, as against what the boxes above
         # ask for. The checkbox can only ask: whether a card was found is
@@ -1562,7 +1588,6 @@ class SettingsWindow(QDialog):
         self.local_llm = LocalModelBox(
             ggml.LLAMA, t("On this machine"),
             ggml.llm_quants, ggml.llm_model_path,
-            binary=lambda: self.conf["local_llm_binary"],
             repos=ggml.llm_repos)
         orr_form.addRow(self.local_llm)
 
@@ -2399,6 +2424,9 @@ class SettingsWindow(QDialog):
         self._processing_device_changed()
         self.local_preload.setChecked(conf["local_preload"])
         self.local_threads.setValue(int(conf["local_threads"]))
+        # A deliberate manual override must not disappear behind a disclosure.
+        self.local_advanced_toggle.setChecked(self.local_threads.value() != 0)
+        self.local_whisper.custom_binary = conf["local_binary"]
         self.local_whisper.load(conf["local_model"])
 
         self.cleanup_enabled.setChecked(conf["cleanup_enabled"])
@@ -2420,6 +2448,7 @@ class SettingsWindow(QDialog):
         self.local_llm_gpu.setChecked(conf["local_llm_gpu"])
         self.local_llm_preload.setChecked(conf["local_llm_preload"])
         self._select_data(self.local_llm_reasoning, conf["local_llm_reasoning"])
+        self.local_llm.custom_binary = conf["local_llm_binary"]
         self.local_llm.load(conf["local_llm_model"], conf["local_llm_repo"])
         self.local_idle_unload.setChecked(conf["local_idle_unload"])
         self.local_idle_minutes.setValue(int(conf["local_idle_minutes"]))
@@ -2527,6 +2556,8 @@ class SettingsWindow(QDialog):
         conf["openrouter_file_model"] = self.file_model.currentText().strip()
         conf["gemini_api_key"] = self.gemini_key.text().strip()
         conf["opencode_api_key"] = self.opencode_key.text().strip()
+        conf["local_binary"] = self.local_whisper.custom_binary
+        conf["local_llm_binary"] = self.local_llm.custom_binary
         conf["local_model"] = self.local_whisper.selected()
         conf["local_device"] = self.local_device.currentData() or "auto"
         conf["local_gpu"] = conf["local_device"] != "cpu"
@@ -2707,10 +2738,18 @@ class SettingsWindow(QDialog):
 
     # ---- api helpers -----------------------------------------------------
 
+    def _toggle_local_advanced(self, expanded):
+        self.local_advanced.setVisible(expanded)
+        self.local_advanced_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
     def _refresh_processing_devices(self):
-        custom = self.conf["local_binary"]
+        custom = self.local_whisper.custom_binary
         self._processing_devices_request += 1
         request = self._processing_devices_request
+        # A previous binary's verified mapping is not evidence for the new
+        # draft (or replacement download). Keep its UUID, not its verification.
+        self._set_processing_devices(self._graphics_devices, ())
 
         def work():
             devices = hardware.graphics_devices()
@@ -2751,6 +2790,26 @@ class SettingsWindow(QDialog):
             self._graphics_devices,
             self._selectable_graphics_devices,
         )
+        selectable = {device.identifier for device in self._selectable_graphics_devices
+                      if device.identifier}
+        if self._graphics_devices and any(
+                not device.identifier or device.identifier not in selectable
+                for device in self._graphics_devices):
+            binary = ggml.program_path(ggml.WHISPER, self.local_whisper.custom_binary)
+            if "GGML_VK_VISIBLE_DEVICES" in os.environ:
+                reason = t("GGML_VK_VISIBLE_DEVICES overrides graphics visibility.")
+            elif not ggml.managed_vulkan_in_use(binary):
+                reason = t("The selected custom or unmanaged program does not provide "
+                           "verified explicit graphics selection.")
+            else:
+                reason = t("The program's graphics device mapping could not be verified.")
+            hint = t("Detected graphics: {devices}. {reason} Automatic may still use "
+                     "a graphics card if the program supports it.",
+                     devices="; ".join(_graphics_device_label(device)
+                                       for device in self._graphics_devices),
+                     reason=reason)
+            label = self.local_whisper.machine_label
+            label.setText(label.text() + "\n" + hint)
 
     def _provider_changed(self):
         """Swap the model box over to the newly chosen provider's own model."""

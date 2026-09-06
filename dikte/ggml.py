@@ -534,7 +534,7 @@ def vulkan_missing(program):
 
 
 def _vulkan_backend_names(log):
-    """Names reported by GGML's managed Vulkan backend, in -dev order."""
+    """Names in Vulkan-local order; callers must verify the other backends."""
     indexed = {}
     for line in log.splitlines():
         if not line.startswith("ggml_vulkan:"):
@@ -557,7 +557,7 @@ def _vulkan_backend_names(log):
 
 
 def managed_vulkan_in_use(binary):
-    """Whether Dikte owns the Vulkan-only whisper binary being launched."""
+    """Whether this is the recorded managed Vulkan binary (not backend proof)."""
     record = _read_record(WHISPER)
     installed = record.get("binary") or ""
     if record.get("backend") != "vulkan" or not installed:
@@ -570,12 +570,25 @@ def managed_vulkan_in_use(binary):
 
 def managed_vulkan_devices(binary, devices=None):
     """Vulkan cards in the managed whisper binary's actual -dev order."""
-    if not managed_vulkan_in_use(binary) \
-            or "GGML_VK_VISIBLE_DEVICES" in os.environ:
+    if not managed_vulkan_in_use(binary) or any(
+        name in os.environ for name in (
+            "GGML_VK_VISIBLE_DEVICES", "GGML_BACKEND_PATH",
+            "LD_PRELOAD", "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+        )
+    ):
+        # Do not rewrite the user's loader environment. Auto/CPU can still
+        # use it, but its backend ordering is outside our mapping contract.
         return ()
+    # PyInstaller sets LD_LIBRARY_PATH for ordinary AppImages. Probe with the
+    # same inherited environment as launch and verify the loaded backends below.
     try:
+        binary = str(pathlib.Path(binary).resolve())
         completed = subprocess.run(
             [binary, "--help"],
+            # The pinned GGML loader searches executable directory AND cwd.
+            # Use the same bundle-only search context as the actual server.
+            cwd=str(pathlib.Path(binary).parent),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -587,6 +600,19 @@ def managed_vulkan_devices(binary, devices=None):
     if completed.returncode != 0:
         return ()
     log = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    # Vulkan's local indices are Whisper's GPU indices only when no other
+    # device backend is loaded. Metadata/path identity alone cannot prove it.
+    loaded = set()
+    for line in log.splitlines():
+        if line.startswith("load_backend: loaded "):
+            backend, separator, source = line[len("load_backend: loaded "):].partition(
+                " backend from "
+            )
+            if not separator or not source.strip() or backend not in {"CPU", "Vulkan"}:
+                return ()
+            loaded.add(backend)
+    if "Vulkan" not in loaded:
+        return ()
     inventory = hardware.graphics_devices() if devices is None else devices
     return hardware.match_backend_devices(
         inventory, _vulkan_backend_names(log)
@@ -1549,6 +1575,15 @@ class Server:
 
     def _launch(self, settings):
         args = self._build(settings)        # raises LocalError when unusable
+        context = {}
+        if self.program == WHISPER and managed_vulkan_in_use(args[0]):
+            args = list(args)
+            # Resolve relative inputs before changing the child's directory;
+            # never chdir the application or alter custom/system/llama runs.
+            args[0] = str(pathlib.Path(args[0]).resolve())
+            model_index = args.index("-m") + 1
+            args[model_index] = str(pathlib.Path(args[model_index]).resolve())
+            context["cwd"] = str(pathlib.Path(args[0]).parent)
         last = ""
         for _ in range(3):
             port = _free_port()
@@ -1567,6 +1602,7 @@ class Server:
                         stdin=subprocess.DEVNULL,
                         # No console window of its own on Windows.
                         creationflags=paths.NO_WINDOW,
+                        **context,
                     )
             except OSError as exc:
                 raise LocalError(t("Could not start {name}: {error}",
