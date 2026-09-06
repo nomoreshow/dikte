@@ -47,6 +47,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
+from . import hardware
 from . import hub
 from . import paths
 from .i18n import t
@@ -531,6 +532,66 @@ def vulkan_missing(program):
             and _read_record(program).get("backend") == "processor")
 
 
+def _vulkan_backend_names(log):
+    """Names reported by GGML's managed Vulkan backend, in -dev order."""
+    indexed = {}
+    for line in log.splitlines():
+        if not line.startswith("ggml_vulkan:"):
+            continue
+        ordinal, separator, details = line[len("ggml_vulkan:"):].partition("=")
+        if not separator:
+            continue
+        try:
+            ordinal = int(ordinal.strip())
+        except ValueError:
+            continue
+        name = details.partition(" | ")[0].strip()
+        if ordinal in indexed and indexed[ordinal] != name:
+            return ()
+        if name:
+            indexed[ordinal] = name
+    if sorted(indexed) != list(range(len(indexed))):
+        return ()
+    return tuple(indexed[index] for index in range(len(indexed)))
+
+
+def managed_vulkan_in_use(binary):
+    """Whether Dikte owns the Vulkan-only whisper binary being launched."""
+    record = _read_record(WHISPER)
+    installed = record.get("binary") or ""
+    if record.get("backend") != "vulkan" or not installed:
+        return False
+    try:
+        return pathlib.Path(binary).resolve() == pathlib.Path(installed).resolve()
+    except OSError:
+        return False
+
+
+def managed_vulkan_devices(binary, devices=None):
+    """Vulkan cards in the managed whisper binary's actual -dev order."""
+    if not managed_vulkan_in_use(binary) \
+            or "GGML_VK_VISIBLE_DEVICES" in os.environ:
+        return ()
+    try:
+        completed = subprocess.run(
+            [binary, "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return ()
+    if completed.returncode != 0:
+        return ()
+    log = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    inventory = hardware.graphics_devices() if devices is None else devices
+    return hardware.match_backend_devices(
+        inventory, _vulkan_backend_names(log)
+    )
+
+
 def program_path(program, custom=""):
     """Which copy of the program to run, or "" when there is none.
 
@@ -540,7 +601,12 @@ def program_path(program, custom=""):
     """
     custom = (custom or "").strip()
     if custom:
-        return custom if os.path.isfile(custom) and os.access(custom, os.X_OK) else ""
+        if not os.path.isfile(custom) or not os.access(custom, os.X_OK):
+            return ""
+        try:
+            return str(pathlib.Path(custom).resolve())
+        except (OSError, RuntimeError):
+            return ""
     return shutil.which(program.binary) or installed_program(program)
 
 
@@ -1557,8 +1623,34 @@ def _whisper_args(settings):
     ]
     if int(settings["threads"]) > 0:
         args += ["-t", str(int(settings["threads"]))]
-    if not settings["gpu"]:
+    selection = settings.get("device", "auto")
+    if not settings["gpu"] or selection == "cpu":
         args.append("-ng")
+    elif selection != "auto":
+        if isinstance(selection, int):
+            raise LocalError(t(
+                "The saved processing device is invalid. Choose a device in Settings."
+            ))
+        else:
+            if not managed_vulkan_in_use(binary):
+                raise LocalError(t(
+                    "A specific graphics card can only be selected with "
+                    "Dikte's managed Vulkan program. Choose Automatic or "
+                    "Processor in Settings."
+                ))
+            device = next(
+                (candidate for candidate in managed_vulkan_devices(binary)
+                 if candidate.identifier == selection),
+                None,
+            )
+            if device is None:
+                raise LocalError(t(
+                    "The selected graphics card is not available. "
+                    "Choose another processing device in Settings."
+                ))
+            backend_index = device.backend_index
+        if backend_index >= 0:
+            args += ["-dev", str(backend_index)]
     return args
 
 
@@ -1584,6 +1676,7 @@ whisper = Server(WHISPER, _whisper_args, {
     "model": "",
     "threads": 0,
     "gpu": True,
+    "device": "auto",
     "binary": "",
 })
 

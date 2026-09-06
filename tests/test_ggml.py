@@ -20,6 +20,7 @@ import zipfile
 from unittest import mock
 
 from dikte import ggml
+from dikte import hardware
 from dikte import hub
 from tests.support import (DikteTest, fake_urlopen, http_error, json_body,
                            linux_only, url_error)
@@ -599,6 +600,15 @@ class WhichCopyRuns(Local):
         mine.chmod(0o755)
         with mock.patch("shutil.which", return_value="/usr/bin/whisper-server"):
             self.assertEqual(ggml.program_path(ggml.WHISPER, str(mine)), str(mine))
+
+    def test_a_relative_custom_program_becomes_its_canonical_absolute_path(self):
+        target = self.path("work/whisper-server")
+        target.parent.mkdir()
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+        with contextlib.chdir(target.parent):
+            found = ggml.program_path(ggml.WHISPER, "whisper-server")
+        self.assertEqual(found, str(target.resolve()))
 
 
 # --- the lists ------------------------------------------------------------
@@ -1190,6 +1200,193 @@ class Arguments(Local):
         args = ggml._whisper_args(settings)
         self.assertIn("-ng", args)
         self.assertEqual(args[args.index("-t") + 1], "2")
+
+    def test_a_raw_graphics_index_is_not_a_stable_device_selection(self):
+        settings = {"binary": str(self.binary), "gpu": True, "device": 2,
+                    "threads": 0, "model": self.whisper_model()}
+        with self.assertRaises(ggml.LocalError):
+            ggml._whisper_args(settings)
+
+    def test_automatic_graphics_leaves_the_device_to_whisper(self):
+        settings = {"binary": str(self.binary), "gpu": True, "device": "auto",
+                    "threads": 0, "model": self.whisper_model()}
+        self.assertNotIn("-dev", ggml._whisper_args(settings))
+
+    def test_managed_vulkan_device_log_is_parsed_in_backend_order(self):
+        log = """\
+load_backend: loaded Vulkan backend\nggml_vulkan: 1 = Intel UHD Graphics (Mesa Intel) | uma: 1 | fp16: 1\nggml_vulkan: malformed\nggml_vulkan: 0 = NVIDIA GeForce RTX 5070 (NVIDIA proprietary) | uma: 0\n"""
+        self.assertIn("_vulkan_backend_names", ggml.__dict__)
+        parser = ggml.__dict__["_vulkan_backend_names"]
+        self.assertEqual(parser(log), (
+            "NVIDIA GeForce RTX 5070 (NVIDIA proprietary)",
+            "Intel UHD Graphics (Mesa Intel)",
+        ))
+
+    def test_conflicting_names_for_one_backend_ordinal_fail_closed(self):
+        log = """\
+ggml_vulkan: 0 = Intel UHD Graphics (Mesa Intel) | uma: 1\nggml_vulkan: 0 = NVIDIA GeForce RTX 5070 (NVIDIA) | uma: 0\n"""
+        self.assertEqual(ggml._vulkan_backend_names(log), ())
+
+    def test_managed_binary_reports_the_selectable_vulkan_devices(self):
+        devices = (
+            hardware.GraphicsDevice("Intel UHD Graphics", 8 << 30, True,
+                                    "vulkan:intel"),
+            hardware.GraphicsDevice("NVIDIA GeForce RTX 5070", 12 << 30, False,
+                                    "vulkan:nvidia"),
+        )
+        completed = mock.Mock(
+            returncode=0,
+            stdout="",
+            stderr=(
+                "ggml_vulkan: 1 = Intel UHD Graphics (Mesa Intel) | uma: 1\n"
+                "ggml_vulkan: 0 = NVIDIA GeForce RTX 5070 "
+                "(NVIDIA proprietary) | uma: 0\n"
+            ),
+        )
+        self.assertIn("managed_vulkan_devices", ggml.__dict__)
+        selector = ggml.__dict__["managed_vulkan_devices"]
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(ggml.subprocess, "run", return_value=completed), \
+                mock.patch.object(hardware, "graphics_devices", return_value=devices):
+            selected = selector(str(self.binary))
+        self.assertEqual(
+            [(device.identifier, device.backend_index) for device in selected],
+            [("vulkan:nvidia", 0), ("vulkan:intel", 1)],
+        )
+
+    def test_managed_mapping_can_use_one_inventory_snapshot(self):
+        device = hardware.GraphicsDevice(
+            "NVIDIA GeForce RTX 5070", 12 << 30, False, "vulkan:nvidia"
+        )
+        completed = mock.Mock(
+            returncode=0,
+            stdout="",
+            stderr=(
+                "ggml_vulkan: 0 = NVIDIA GeForce RTX 5070 "
+                "(NVIDIA proprietary) | uma: 0\n"
+            ),
+        )
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(ggml.subprocess, "run", return_value=completed), \
+                mock.patch.object(
+                    hardware, "graphics_devices",
+                    side_effect=AssertionError("second inventory probe"),
+                ):
+            try:
+                selected = ggml.__dict__["managed_vulkan_devices"](
+                    str(self.binary), (device,)
+                )
+            except TypeError:
+                selected = "inventory argument unsupported"
+        self.assertEqual(
+            [(item.identifier, item.backend_index) for item in selected]
+            if selected != "inventory argument unsupported" else selected,
+            [("vulkan:nvidia", 0)],
+        )
+
+    def test_a_failed_backend_probe_does_not_offer_partial_device_output(self):
+        device = hardware.GraphicsDevice(
+            "NVIDIA GeForce RTX 5070", 12 << 30, False, "vulkan:nvidia"
+        )
+        completed = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "ggml_vulkan: 0 = NVIDIA GeForce RTX 5070 "
+                "(NVIDIA proprietary) | uma: 0\nbackend crashed\n"
+            ),
+        )
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(ggml.subprocess, "run", return_value=completed), \
+                mock.patch.object(hardware, "graphics_devices", return_value=(device,)):
+            self.assertEqual(
+                ggml.managed_vulkan_devices(str(self.binary)), ()
+            )
+
+    def test_a_vulkan_backend_probe_timeout_disables_explicit_choices(self):
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(
+                    ggml.subprocess, "run",
+                    side_effect=ggml.subprocess.TimeoutExpired("whisper-server", 2),
+                ):
+            selected = ggml.managed_vulkan_devices(str(self.binary))
+        self.assertEqual(selected, ())
+
+    def test_a_backend_log_decode_failure_disables_explicit_choices(self):
+        failure = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(ggml.subprocess, "run", side_effect=failure):
+            selected = ggml.managed_vulkan_devices(str(self.binary))
+        self.assertEqual(selected, ())
+
+    def test_vulkan_probe_timeout_is_short_enough_for_settings(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(
+                    ggml.subprocess, "run", return_value=completed
+                ) as probe:
+            ggml.managed_vulkan_devices(str(self.binary))
+        self.assertLessEqual(probe.call_args.kwargs["timeout"], 2)
+
+    def test_an_external_ggml_vulkan_filter_disables_explicit_choices(self):
+        completed = mock.Mock(stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"GGML_VK_VISIBLE_DEVICES": "1,0"}), \
+                mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(
+                    ggml.subprocess, "run", return_value=completed
+                ) as probe:
+            selected = ggml.managed_vulkan_devices(str(self.binary))
+        probe.assert_not_called()
+        self.assertEqual(selected, ())
+
+    def test_an_empty_ggml_vulkan_filter_still_hides_all_devices(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"GGML_VK_VISIBLE_DEVICES": ""}), \
+                mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
+                mock.patch.object(
+                    ggml.subprocess, "run", return_value=completed
+                ) as probe:
+            selected = ggml.managed_vulkan_devices(str(self.binary))
+        probe.assert_not_called()
+        self.assertEqual(selected, ())
+
+    def test_a_saved_graphics_identity_resolves_immediately_before_launch(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "Intel Arc A770", 16 << 30, False, identifier, 1,
+        )
+        settings = {"binary": str(self.binary), "gpu": True,
+                    "device": identifier, "threads": 0,
+                    "model": self.whisper_model()}
+        with mock.patch.object(
+                ggml, "managed_vulkan_devices", return_value=(device,)
+        ), mock.patch.object(ggml, "_read_record", return_value={
+                "binary": str(self.binary), "backend": "vulkan",
+        }):
+            args = ggml._whisper_args(settings)
+        self.assertEqual(args[args.index("-dev") + 1], "1")
+
+    def test_a_custom_binary_cannot_receive_an_unverified_vulkan_index(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        settings = {"binary": str(self.binary), "gpu": True,
+                    "device": identifier, "threads": 0,
+                    "model": self.whisper_model()}
+        with self.assertRaises(ggml.LocalError) as caught:
+            ggml._whisper_args(settings)
+        self.assertIn("managed Vulkan", str(caught.exception))
+
+    def test_an_unavailable_saved_graphics_card_stops_instead_of_substituting(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        settings = {"binary": str(self.binary), "gpu": True,
+                    "device": identifier, "threads": 0,
+                    "model": self.whisper_model()}
+        with mock.patch.object(ggml, "managed_vulkan_devices", return_value=()), \
+                mock.patch.object(ggml, "_read_record", return_value={
+                    "binary": str(self.binary), "backend": "vulkan",
+                }):
+            with self.assertRaises(ggml.LocalError) as caught:
+                ggml._whisper_args(settings)
+        self.assertIn("graphics card is not available", str(caught.exception))
 
     def test_a_missing_model_is_a_message_about_settings(self):
         with self.assertRaises(ggml.LocalError) as caught:

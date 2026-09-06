@@ -23,6 +23,7 @@ from . import cleanup
 from . import config as cfg
 from . import filetranscribe
 from . import ggml
+from . import hardware
 from . import hotkey
 from . import hub
 from . import i18n
@@ -39,6 +40,16 @@ LANGUAGES = [
     ("German", "de"), ("French", "fr"), ("Spanish", "es"), ("Arabic", "ar"),
 ]
 CORNERS = ["bottom-left", "bottom-right", "top-left", "top-right"]
+
+
+def _graphics_device_label(device):
+    if not device.memory or device.shared is None:
+        return device.name
+    kind = t("shared") if device.shared else t("dedicated")
+    return t("{name} — {size} {kind} graphics memory",
+             name=device.name, size=ggml.human_size(device.memory), kind=kind)
+
+
 # The provider box offers what config knows how to reach, this machine first.
 TRANSCRIBE_PROVIDERS = ([("This machine (whisper.cpp)", "local")]
                         + [(who.service, name)
@@ -252,6 +263,7 @@ class LocalModelBox(QGroupBox):
     _installed = pyqtSignal(str, str)
 
     changed = pyqtSignal()
+    program_changed = pyqtSignal()
 
     def __init__(self, program, title, models, model_path, repos=None, parent=None):
         super().__init__(title, parent)
@@ -450,13 +462,44 @@ class LocalModelBox(QGroupBox):
                 t("Downloaded, version {version}.",
                   version=ggml.installed_version(self.program) or "?"))
 
-    def _show_machine(self):
+    def _show_machine(self, selection=None, devices=(), selectable=None):
         where = ggml.accelerator()
         memory = ggml.total_memory()
-        parts = [t("Graphics: {name}.", name=where) if where else
-                 t("No graphics interface found, so this runs on the processor.")]
+        parts = []
+        selectable = devices if selectable is None else selectable
+        chosen = next(
+            (device for device in selectable
+             if device.identifier and device.identifier == selection),
+            None,
+        )
+        if selection == "cpu":
+            parts.append(t("Selected processing: Processor (CPU)."))
+        elif selection == "auto":
+            parts.append(t("Selected processing: Automatic (whisper.cpp default)."))
+        elif selection:
+            if chosen is None:
+                parts.append(t("Selected processing: Graphics card unavailable."))
+            else:
+                parts.append(t("Selected processing: {name} (Vulkan).",
+                               name=chosen.name))
+                if chosen.memory and chosen.shared is not None:
+                    label = (t("Shared graphics memory") if chosen.shared else
+                             t("Dedicated graphics memory"))
+                    parts.append(t("{label}: {size}.", label=label,
+                                   size=ggml.human_size(chosen.memory)))
+        if selection in ("cpu", "auto"):
+            if devices:
+                parts.append(t("Available graphics: {devices}.", devices="; ".join(
+                    _graphics_device_label(device) for device in devices
+                )))
+            elif where:
+                parts.append(t("Available graphics interface: {name}.", name=where))
+        elif selection is None:
+            parts.append(t("Available graphics interface: {name}.", name=where) if where
+                         else t("No graphics interface found, so processing is "
+                                "available on the processor."))
         if memory:
-            parts.append(t("Memory: {size}.", size=ggml.human_size(memory)))
+            parts.append(t("System memory: {size}.", size=ggml.human_size(memory)))
         self.machine_label.setText(" ".join(parts))
 
     # ---- the lists -------------------------------------------------------
@@ -710,6 +753,7 @@ class LocalModelBox(QGroupBox):
         # changes what it should read.
         self._refresh_buttons()
         self.changed.emit()
+        self.program_changed.emit()
 
     def _current_item(self):
         return self.model.currentData(Qt.ItemDataRole.UserRole + 1)
@@ -881,11 +925,14 @@ class SettingsWindow(QDialog):
     _test_done = pyqtSignal(str, bool, str)
     # The release that was found, or None, and what went wrong instead.
     _update_checked = pyqtSignal(object, str)
+    _processing_devices_loaded = pyqtSignal(object, object, int)
 
     def __init__(self, conf, meetings=None, parent=None):
         super().__init__(parent)
         self.conf = conf
         self.meetings = meetings
+        self._processing_devices_request = 0
+        self._processing_devices_loaded.connect(self._set_processing_devices)
         # Filled in by _shortcut_row as the tabs are built: which combination
         # box, status label and "nothing installed" line belong to each of the
         # global shortcuts. One dictionary is what lets install, remove and the
@@ -951,6 +998,8 @@ class SettingsWindow(QDialog):
             self.meetings.finished.connect(self._on_minutes_finished)
             self.meetings.failed.connect(self._on_minutes_failed)
         self._load()
+        self.local_whisper.program_changed.connect(self._refresh_processing_devices)
+        self._refresh_processing_devices()
         self._load_codex_models()
         self._load_agy_models()
         self._load_hosted_models()
@@ -1194,11 +1243,19 @@ class SettingsWindow(QDialog):
             ggml.whisper_models, ggml.whisper_model_path)
         stt_form.addRow(self.local_whisper)
 
-        self.local_gpu = QCheckBox(t("Use the graphics card"))
-        self.local_gpu.setToolTip(
-            t("whisper.cpp reaches the card through CUDA, ROCm or Vulkan when the "
-              "build it is running was made with one. A build without any of them "
-              "runs on the processor whatever this says."))
+        self.local_device = QComboBox()
+        self.local_device.addItem(t("Automatic (whisper.cpp default)"), "auto")
+        self.local_device.addItem(t("Processor (CPU)"), "cpu")
+        self._graphics_devices = ()
+        self._selectable_graphics_devices = ()
+        LocalModelBox._fit_popup(self.local_device)
+        self.local_device.setToolTip(t(
+            "Automatic lets whisper.cpp choose a graphics card when its build "
+            "supports one. Processor keeps all speech recognition on the CPU."
+        ))
+        self.local_device.currentIndexChanged.connect(
+            self._processing_device_changed
+        )
         self.local_preload = QCheckBox(t("Load the model when Dikte starts"))
         self.local_preload.setToolTip(
             t("A large model takes a second or two to load. Loading it up front "
@@ -1218,7 +1275,7 @@ class SettingsWindow(QDialog):
         self.local_options = QWidget()
         options_form = QFormLayout(self.local_options)
         options_form.setContentsMargins(0, 0, 0, 0)
-        options_form.addRow("", self.local_gpu)
+        options_form.addRow(t("Processing device"), self.local_device)
         options_form.addRow("", self.local_preload)
         options_form.addRow(t("Threads"), self.local_threads)
         stt_form.addRow(self.local_options)
@@ -2107,7 +2164,15 @@ class SettingsWindow(QDialog):
         self._select_data(self.transcribe_provider, conf["transcribe_provider"])
         self._provider_changed()  # selecting index 0 fires no signal
         self.file_model.setCurrentText(conf["openrouter_file_model"])
-        self.local_gpu.setChecked(conf["local_gpu"])
+        processing_device = conf["local_device"]
+        if processing_device not in ("auto", "cpu") \
+                and self.local_device.findData(processing_device) < 0:
+            self.local_device.addItem(
+                t("Previously selected graphics card (unavailable)"),
+                processing_device,
+            )
+        self._select_data(self.local_device, processing_device)
+        self._processing_device_changed()
         self.local_preload.setChecked(conf["local_preload"])
         self.local_threads.setValue(int(conf["local_threads"]))
         self.local_whisper.load(conf["local_model"])
@@ -2234,7 +2299,8 @@ class SettingsWindow(QDialog):
         conf["gemini_api_key"] = self.gemini_key.text().strip()
         conf["opencode_api_key"] = self.opencode_key.text().strip()
         conf["local_model"] = self.local_whisper.selected()
-        conf["local_gpu"] = self.local_gpu.isChecked()
+        conf["local_device"] = self.local_device.currentData() or "auto"
+        conf["local_gpu"] = conf["local_device"] != "cpu"
         conf["local_preload"] = self.local_preload.isChecked()
         conf["local_threads"] = self.local_threads.value()
 
@@ -2397,6 +2463,51 @@ class SettingsWindow(QDialog):
         combo.setCurrentIndex(index if index >= 0 else 0)
 
     # ---- api helpers -----------------------------------------------------
+
+    def _refresh_processing_devices(self):
+        custom = self.conf["local_binary"]
+        self._processing_devices_request += 1
+        request = self._processing_devices_request
+
+        def work():
+            devices = hardware.graphics_devices()
+            binary = ggml.program_path(ggml.WHISPER, custom)
+            managed = ggml.managed_vulkan_devices(binary, devices)
+            self._processing_devices_loaded.emit(devices, managed, request)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_processing_devices(self, devices, managed, request=None):
+        if request is not None and request != self._processing_devices_request:
+            return
+        current = self.local_device.currentData() or "auto"
+        self._graphics_devices = tuple(devices)
+        self._selectable_graphics_devices = tuple(managed)
+        self.local_device.blockSignals(True)
+        self.local_device.clear()
+        self.local_device.addItem(t("Automatic (whisper.cpp default)"), "auto")
+        self.local_device.addItem(t("Processor (CPU)"), "cpu")
+        for device in managed:
+            if device.identifier:
+                self.local_device.addItem(
+                    _graphics_device_label(device), device.identifier
+                )
+        if current not in ("auto", "cpu") \
+                and self.local_device.findData(current) < 0:
+            self.local_device.addItem(
+                t("Previously selected graphics card (unavailable)"), current
+            )
+        self._select_data(self.local_device, current)
+        self.local_device.blockSignals(False)
+        LocalModelBox._fit_popup(self.local_device)
+        self._processing_device_changed()
+
+    def _processing_device_changed(self):
+        self.local_whisper._show_machine(
+            self.local_device.currentData() or "auto",
+            self._graphics_devices,
+            self._selectable_graphics_devices,
+        )
 
     def _provider_changed(self):
         """Swap the model box over to the newly chosen provider's own model."""
