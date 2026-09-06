@@ -31,13 +31,13 @@ class TrayClicks(unittest.TestCase):
     def test_other_platforms_keep_the_native_context_menu(self):
         self.assertTrue(app._uses_native_tray_context_menu("linux"))
 
-    def test_an_idle_macos_left_click_opens_settings_only(self):
+    def test_an_idle_macos_left_click_starts_dictation_only(self):
         target, calls = self.target()
         with mock.patch.object(sys, "platform", "darwin"):
             app.Dikte._tray_clicked(
                 cast(app.Dikte, target), QSystemTrayIcon.ActivationReason.Trigger,
             )
-        self.assertEqual(calls, ["settings"])
+        self.assertEqual(calls, ["toggle"])
 
     def test_a_macos_right_click_opens_the_menu_only(self):
         target, calls = self.target()

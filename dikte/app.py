@@ -329,9 +329,6 @@ class Dikte:
             return
         if reason != QSystemTrayIcon.ActivationReason.Trigger:
             return
-        if sys.platform == "darwin" and not self.recording:
-            self.open_settings()
-            return
         # The icon ends whatever is being recorded rather than only a dictation.
         # The two shortcuts are each tied to their own mode, on purpose, but the
         # icon is one button: having it refuse to stop a recording it can see is
