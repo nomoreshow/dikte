@@ -542,11 +542,13 @@ def _macos_homebrew_program(program):
         prefix = "/usr/local"
     else:
         return ""
-    candidate = os.path.join(
-        prefix, "opt", "whisper-cpp", "bin", program.binary,
-    )
-    return (candidate if os.path.isfile(candidate)
-            and os.access(candidate, os.X_OK) else "")
+    for formula in ("whisper-cpp", "whisper.cpp"):
+        candidate = os.path.join(
+            prefix, "opt", formula, "bin", program.binary,
+        )
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
 
 
 def program_path(program, custom=""):

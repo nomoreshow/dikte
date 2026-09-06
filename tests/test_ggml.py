@@ -603,6 +603,23 @@ class WhichCopyRuns(Local):
                     with mock.patch("os.access", return_value=True):
                         self.assertEqual(ggml.program_path(ggml.WHISPER), expected)
 
+    def test_macos_finds_the_renamed_homebrew_formula(self):
+        for arch, prefix in (("arm64", "/opt/homebrew"),
+                             ("x86_64", "/usr/local")):
+            expected = f"{prefix}/opt/whisper.cpp/bin/whisper-server"
+            with self.subTest(arch=arch):
+                with mock.patch.object(sys, "platform", "darwin"):
+                    with mock.patch.object(ggml.platform, "machine",
+                                           return_value=arch):
+                        with mock.patch("shutil.which", return_value=None):
+                            with mock.patch(
+                                    "os.path.isfile",
+                                    side_effect=lambda path: str(path) == expected):
+                                with mock.patch("os.access", return_value=True):
+                                    self.assertEqual(
+                                        ggml.program_path(ggml.WHISPER), expected,
+                                    )
+
     def test_homebrew_whisper_is_reported_as_a_system_program(self):
         expected = "/opt/homebrew/opt/whisper-cpp/bin/whisper-server"
         self.patch_attr(sys, "platform", "darwin")
