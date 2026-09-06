@@ -7,6 +7,28 @@ from unittest import mock
 from dikte import hardware
 
 
+class CpuThreads(unittest.TestCase):
+    def test_affinity_takes_precedence_over_total_logical_cpus(self):
+        with mock.patch.object(hardware.os, "sched_getaffinity",
+                               return_value={2, 4, 6}, create=True), \
+                mock.patch.object(hardware.os, "cpu_count", return_value=32):
+            self.assertEqual(hardware.cpu_threads(), 3)
+
+    def test_missing_or_unusable_affinity_falls_back_to_logical_cpus(self):
+        for error in (AttributeError, OSError, NotImplementedError):
+            with self.subTest(error=error), \
+                    mock.patch.object(hardware.os, "sched_getaffinity",
+                                      side_effect=error, create=True), \
+                    mock.patch.object(hardware.os, "cpu_count", return_value=8):
+                self.assertEqual(hardware.cpu_threads(), 8)
+
+    def test_unknown_cpu_count_still_allows_one_worker(self):
+        with mock.patch.object(hardware.os, "sched_getaffinity",
+                               side_effect=AttributeError, create=True), \
+                mock.patch.object(hardware.os, "cpu_count", return_value=None):
+            self.assertEqual(hardware.cpu_threads(), 1)
+
+
 class VulkanCall:
     """A Python callable that accepts ctypes function metadata."""
 
