@@ -452,7 +452,8 @@ DEFAULTS = {
     # opens with the Download button already on the right model.
     "local_model": ggml.SUGGESTED_WHISPER,
     "local_threads": 0,             # 0 -> whisper.cpp picks
-    "local_gpu": True,
+    "local_gpu": True,               # retained for older settings files
+    "local_device": "auto",          # auto | cpu | stable Vulkan device UUID
     "local_preload": True,          # load the model while Dikte starts, rather
                                     # than on the first dictation
     "local_binary": "",             # empty -> whichever copy ggml.py finds
@@ -637,6 +638,7 @@ class Config:
         self.load()
 
     def load(self):
+        stored = {}
         try:
             with open(CONFIG_FILE, encoding="utf-8") as fh:
                 stored = json.load(fh)
@@ -658,6 +660,10 @@ class Config:
                   f"the unreadable file was kept as {broken}")
         except OSError as exc:
             print(f"dikte: could not read settings ({exc}), using defaults")
+        if not isinstance(stored, dict) or "local_device" not in stored:
+            self.data["local_device"] = (
+                "auto" if self.data["local_gpu"] else "cpu"
+            )
         self.data["overlay_corner"] = _CORNER_MIGRATION.get(
             self.data["overlay_corner"], self.data["overlay_corner"]
         )
@@ -749,10 +755,14 @@ class Config:
 
     def apply_local(self):
         """Hand the local settings to the servers, restarting what they change."""
+        device = self["local_device"]
+        if device == "auto" and not self["local_gpu"]:
+            device = "cpu"
         ggml.whisper.configure(
             model=self["local_model"],
             threads=int(self["local_threads"]),
-            gpu=bool(self["local_gpu"]),
+            gpu=device != "cpu",
+            device=device,
             binary=self["local_binary"],
         )
         ggml.llm.configure(
