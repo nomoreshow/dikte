@@ -599,7 +599,9 @@ class WhichCopyRuns(Local):
         mine.write_text("#!/bin/sh\n")
         mine.chmod(0o755)
         with mock.patch("shutil.which", return_value="/usr/bin/whisper-server"):
-            self.assertEqual(ggml.program_path(ggml.WHISPER, str(mine)), str(mine))
+            self.assertEqual(
+                ggml.program_path(ggml.WHISPER, str(mine)), str(mine.resolve()),
+            )
 
     def test_a_relative_custom_program_becomes_its_canonical_absolute_path(self):
         target = self.path("work/whisper-server")
