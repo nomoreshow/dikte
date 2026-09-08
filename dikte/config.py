@@ -10,6 +10,7 @@ import time
 
 from . import api
 from . import ggml
+from . import hardware
 from . import i18n
 from . import paste
 from . import paths
@@ -632,6 +633,16 @@ _CORNER_MIGRATION = {
 }
 
 
+def _local_thread_count(value):
+    """A stored whole manual count, or Automatic for malformed values."""
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 class Config:
     def __init__(self):
         self.data = dict(DEFAULTS)
@@ -644,6 +655,9 @@ class Config:
                 stored = json.load(fh)
             if isinstance(stored, dict):
                 self.data.update({k: v for k, v in stored.items() if k in DEFAULTS})
+                self.data["local_threads"] = _local_thread_count(
+                    self.data["local_threads"]
+                )
         except FileNotFoundError:
             pass
         except json.JSONDecodeError as exc:
@@ -758,9 +772,12 @@ class Config:
         device = self["local_device"]
         if device == "auto" and not self["local_gpu"]:
             device = "cpu"
+        requested_threads = _local_thread_count(self["local_threads"])
+        threads = (min(requested_threads, hardware.cpu_threads())
+                   if requested_threads else 0)
         ggml.whisper.configure(
             model=self["local_model"],
-            threads=int(self["local_threads"]),
+            threads=threads,
             gpu=device != "cpu",
             device=device,
             binary=self["local_binary"],

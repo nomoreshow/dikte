@@ -19,6 +19,7 @@ from dikte import api
 from dikte import cleanup
 from dikte import config as cfg
 from dikte import ggml
+from dikte import hardware
 from dikte import i18n
 from dikte import paste
 from tests.support import DikteTest
@@ -32,6 +33,12 @@ class Loading(DikteTest):
     def test_a_stored_value_wins(self):
         self.write_config({"cleanup_model": "some/other-model"})
         self.assertEqual(cfg.Config()["cleanup_model"], "some/other-model")
+
+    def test_invalid_saved_local_threads_recover_as_automatic(self):
+        for value in ("not-a-number", None, [], -3, float("inf"), True, 3.5):
+            with self.subTest(value=value):
+                self.write_config({"local_threads": value})
+                self.assertEqual(cfg.Config()["local_threads"], 0)
 
     def test_the_old_gpu_checkbox_migrates_to_a_processing_device(self):
         for old_value, expected in ((True, "auto"), (False, "cpu")):
@@ -714,6 +721,21 @@ class ReadyToRun(DikteTest):
         conf.apply_local()
         self.addCleanup(ggml.whisper.configure, device="auto")
         self.assertEqual(ggml.whisper.settings()["device"], identifier)
+
+    def test_an_oversized_thread_preference_is_bounded_only_at_runtime(self):
+        conf = self.config(local_threads=30)
+        with mock.patch.object(hardware, "cpu_threads", return_value=8):
+            conf.apply_local()
+        self.addCleanup(ggml.whisper.configure, threads=0)
+        self.assertEqual(ggml.whisper.settings()["threads"], 8)
+        self.assertEqual(conf["local_threads"], 30)
+
+    def test_automatic_threads_stays_automatic_at_runtime(self):
+        conf = self.config(local_threads=0)
+        with mock.patch.object(hardware, "cpu_threads", return_value=8):
+            conf.apply_local()
+        self.addCleanup(ggml.whisper.configure, threads=0)
+        self.assertEqual(ggml.whisper.settings()["threads"], 0)
 
     def test_the_processing_device_is_the_source_of_truth_over_the_old_checkbox(self):
         for selection, old_gpu, expected_gpu in (

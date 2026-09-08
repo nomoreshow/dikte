@@ -2152,7 +2152,7 @@ class LocalModels(DikteTest):
                 self.assertEqual(window.local_threads.maximum(), count)
                 self.assertEqual(window.local_threads.text(), "Automatic")
 
-    def test_saved_thread_count_is_bounded_only_when_settings_are_saved(self):
+    def test_an_untouched_oversized_thread_preference_is_not_destroyed(self):
         conf = self.config(local_threads=30)
         with mock.patch.object(hardware, "cpu_threads", return_value=8):
             window = self.window(conf)
@@ -2160,8 +2160,18 @@ class LocalModels(DikteTest):
         self.assertEqual(conf["local_threads"], 30)
         with mock.patch.object(QMessageBox, "information"):
             window._save()
-        self.assertEqual(conf["local_threads"], 8)
-        self.assertEqual(self.read_config_file()["local_threads"], 8)
+        self.assertEqual(conf["local_threads"], 30)
+        self.assertEqual(self.read_config_file()["local_threads"], 30)
+
+    def test_editing_a_bounded_thread_preference_saves_the_new_value(self):
+        conf = self.config(local_threads=30)
+        with mock.patch.object(hardware, "cpu_threads", return_value=8):
+            window = self.window(conf)
+        window.local_threads.setValue(7)
+        with mock.patch.object(QMessageBox, "information"):
+            window._save()
+        self.assertEqual(conf["local_threads"], 7)
+        self.assertEqual(self.read_config_file()["local_threads"], 7)
 
     def test_the_processing_device_loads_cpu_without_a_checkbox(self):
         window = self.window(self.config(local_device="cpu", local_gpu=False))

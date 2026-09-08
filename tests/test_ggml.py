@@ -1499,6 +1499,16 @@ class Arguments(Local):
 
     def setUp(self):
         super().setUp()
+        clean_environment = os.environ.copy()
+        for name in (
+            "GGML_VK_VISIBLE_DEVICES", "GGML_BACKEND_PATH", "LD_PRELOAD",
+            "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+        ):
+            clean_environment.pop(name, None)
+        environment = mock.patch.dict(os.environ, clean_environment, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.binary = self.path("whisper-server")
         self.binary.write_text("#!/bin/sh\n")
         self.binary.chmod(0o755)
@@ -1542,9 +1552,7 @@ class Arguments(Local):
     def test_managed_vulkan_device_log_is_parsed_in_backend_order(self):
         log = """\
 load_backend: loaded Vulkan backend\nggml_vulkan: 1 = Intel UHD Graphics (Mesa Intel) | uma: 1 | fp16: 1\nggml_vulkan: malformed\nggml_vulkan: 0 = NVIDIA GeForce RTX 5070 (NVIDIA proprietary) | uma: 0\n"""
-        self.assertIn("_vulkan_backend_names", ggml.__dict__)
-        parser = ggml.__dict__["_vulkan_backend_names"]
-        self.assertEqual(parser(log), (
+        self.assertEqual(ggml._vulkan_backend_names(log), (
             "NVIDIA GeForce RTX 5070 (NVIDIA proprietary)",
             "Intel UHD Graphics (Mesa Intel)",
         ))
@@ -1709,12 +1717,10 @@ ggml_vulkan: 0 = Intel UHD Graphics (Mesa Intel) | uma: 1\nggml_vulkan: 0 = NVID
                 "load_backend: loaded CPU backend from /bundle/libggml-cpu.so\n"
             ),
         )
-        self.assertIn("managed_vulkan_devices", ggml.__dict__)
-        selector = ggml.__dict__["managed_vulkan_devices"]
         with mock.patch.object(ggml, "managed_vulkan_in_use", return_value=True), \
                 mock.patch.object(ggml.subprocess, "run", return_value=completed), \
                 mock.patch.object(hardware, "graphics_devices", return_value=devices):
-            selected = selector(str(self.binary))
+            selected = ggml.managed_vulkan_devices(str(self.binary))
         self.assertEqual(
             [(device.identifier, device.backend_index) for device in selected],
             [("vulkan:nvidia", 0), ("vulkan:intel", 1)],
@@ -1739,15 +1745,9 @@ ggml_vulkan: 0 = Intel UHD Graphics (Mesa Intel) | uma: 1\nggml_vulkan: 0 = NVID
                     hardware, "graphics_devices",
                     side_effect=AssertionError("second inventory probe"),
                 ):
-            try:
-                selected = ggml.__dict__["managed_vulkan_devices"](
-                    str(self.binary), (device,)
-                )
-            except TypeError:
-                selected = "inventory argument unsupported"
+            selected = ggml.managed_vulkan_devices(str(self.binary), (device,))
         self.assertEqual(
-            [(item.identifier, item.backend_index) for item in selected]
-            if selected != "inventory argument unsupported" else selected,
+            [(item.identifier, item.backend_index) for item in selected],
             [("vulkan:nvidia", 0)],
         )
 

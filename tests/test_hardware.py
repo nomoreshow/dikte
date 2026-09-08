@@ -193,20 +193,6 @@ class VulkanDevices(unittest.TestCase):
         )
         self.assertIsNone(device)
 
-    def test_a_device_keeps_its_stable_identity_and_whisper_gpu_index(self):
-        device = hardware._vulkan_device(
-            "NVIDIA GeForce RTX 5070",
-            hardware.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
-            [(12 << 30, hardware.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)],
-            identifier="vulkan:00112233445566778899aabbccddeeff",
-            backend_index=2,
-        )
-        self.assertEqual(
-            (device.identifier, device.backend_index),
-            ("vulkan:00112233445566778899aabbccddeeff", 2),
-        )
-
-
     def test_backend_reported_order_is_mapped_to_stable_vulkan_devices(self):
         devices = (
             hardware.GraphicsDevice("Intel UHD Graphics", 8 << 30, True,
@@ -214,9 +200,7 @@ class VulkanDevices(unittest.TestCase):
             hardware.GraphicsDevice("NVIDIA GeForce RTX 5070", 12 << 30, False,
                                     "vulkan:nvidia"),
         )
-        matcher = getattr(hardware, "match_backend_devices", None)
-        self.assertTrue(callable(matcher))
-        mapped = matcher(devices, (
+        mapped = hardware.match_backend_devices(devices, (
             "NVIDIA GeForce RTX 5070 (NVIDIA proprietary)",
             "Intel UHD Graphics (Mesa Intel)",
         ))

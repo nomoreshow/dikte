@@ -1466,10 +1466,11 @@ class SettingsWindow(QDialog):
               "spends that once instead of on the first dictation, at the cost of "
               "the memory it sits in."))
         self.local_threads = QSpinBox()
+        self._local_threads_changed = False
         self.local_threads.setRange(0, hardware.cpu_threads())
         self.local_threads.setSpecialValueText(t("Automatic"))
         self.local_threads.setToolTip(t(
-            "CPU worker threads. This process can use up to {count} logical CPUs. "
+            "CPU-thread limit available to this process: {count}. "
             "Automatic lets whisper.cpp choose. More threads are not always faster.",
             count=self.local_threads.maximum(),
         ))
@@ -2424,6 +2425,8 @@ class SettingsWindow(QDialog):
         self._processing_device_changed()
         self.local_preload.setChecked(conf["local_preload"])
         self.local_threads.setValue(int(conf["local_threads"]))
+        self._local_threads_changed = False
+        self.local_threads.valueChanged.connect(self._local_threads_was_changed)
         # A deliberate manual override must not disappear behind a disclosure.
         self.local_advanced_toggle.setChecked(self.local_threads.value() != 0)
         self.local_whisper.custom_binary = conf["local_binary"]
@@ -2562,7 +2565,8 @@ class SettingsWindow(QDialog):
         conf["local_device"] = self.local_device.currentData() or "auto"
         conf["local_gpu"] = conf["local_device"] != "cpu"
         conf["local_preload"] = self.local_preload.isChecked()
-        conf["local_threads"] = self.local_threads.value()
+        if self._local_threads_changed:
+            conf["local_threads"] = self.local_threads.value()
 
         conf["cleanup_enabled"] = self.cleanup_enabled.isChecked()
         conf["cleanup_provider"] = self.cleanup_provider.currentData() or "openrouter"
@@ -2742,6 +2746,9 @@ class SettingsWindow(QDialog):
         self.local_advanced.setVisible(expanded)
         self.local_advanced_toggle.setArrowType(
             Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    def _local_threads_was_changed(self):
+        self._local_threads_changed = True
 
     def _refresh_processing_devices(self):
         custom = self.local_whisper.custom_binary

@@ -263,7 +263,7 @@ def _enumerate_vulkan(library):
         library.vkDestroyInstance(instance, None)
 
 
-def _vulkan_device(name, device_type, heaps, identifier="", backend_index=None):
+def _vulkan_device(name, device_type, heaps, identifier=""):
     """One displayable Vulkan device, without host-only memory heaps."""
     if device_type == VK_PHYSICAL_DEVICE_TYPE_CPU:
         return None
@@ -278,5 +278,4 @@ def _vulkan_device(name, device_type, heaps, identifier="", backend_index=None):
         memory=memory,
         shared=shared,
         identifier=identifier,
-        backend_index=backend_index,
     )
