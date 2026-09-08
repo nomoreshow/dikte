@@ -1934,13 +1934,19 @@ class LocalModels(DikteTest):
         identifier = "vulkan:00112233445566778899aabbccddeeff"
         device = hardware.GraphicsDevice("Detected GPU", 12 << 30, False, identifier, None)
         window = self.window(self.config(local_device=identifier))
+        original_environment = dict(os.environ)
+        base_environment = dict(os.environ)
+        base_environment.pop("GGML_VK_VISIBLE_DEVICES", None)
         for managed, environment, reason in (
                 (False, {}, "custom or unmanaged program"),
                 (True, {"GGML_VK_VISIBLE_DEVICES": "0"}, "GGML_VK_VISIBLE_DEVICES"),
                 (True, {}, "mapping could not be verified")):
             with self.subTest(reason=reason), \
                     mock.patch.object(ggml, "managed_vulkan_in_use", return_value=managed), \
-                    mock.patch.dict(os.environ, environment, clear=True):
+                    mock.patch.object(ggml, "accelerator", return_value="Vulkan"), \
+                    mock.patch.dict(
+                        os.environ, base_environment | environment, clear=True
+                    ):
                 window._set_processing_devices((device,), ())
                 text = window.local_whisper.machine_label.text()
                 self.assertIn("Detected GPU", text)
@@ -1948,6 +1954,7 @@ class LocalModels(DikteTest):
                 self.assertIn("Automatic may still use a graphics card", text)
                 self.assertEqual(window.local_device.currentData(), identifier)
                 self.assertIn("unavailable", window.local_device.currentText())
+        self.assertEqual(dict(os.environ), original_environment)
         window._set_processing_devices((), ())
         self.assertNotIn("Detected GPU", window.local_whisper.machine_label.text())
         self.assertIn("Graphics card unavailable", window.local_whisper.machine_label.text())
@@ -2163,6 +2170,17 @@ class LocalModels(DikteTest):
         self.assertEqual(conf["local_threads"], 30)
         self.assertEqual(self.read_config_file()["local_threads"], 30)
 
+    def test_a_value_larger_than_qt_can_hold_opens_at_the_runtime_cap(self):
+        stored = 2 ** 40
+        conf = self.config(local_threads=stored)
+        with mock.patch.object(hardware, "cpu_threads", return_value=8):
+            window = self.window(conf)
+        self.assertEqual(window.local_threads.value(), 8)
+        self.assertEqual(conf["local_threads"], stored)
+        with mock.patch.object(QMessageBox, "information"):
+            window._save()
+        self.assertEqual(self.read_config_file()["local_threads"], stored)
+
     def test_editing_a_bounded_thread_preference_saves_the_new_value(self):
         conf = self.config(local_threads=30)
         with mock.patch.object(hardware, "cpu_threads", return_value=8):
@@ -2270,12 +2288,7 @@ class LocalModels(DikteTest):
         self.assertFalse(conf["local_gpu"])
 
     def test_changing_the_processing_device_updates_the_summary_immediately(self):
-        device = hardware.GraphicsDevice(
-            "AMD Radeon RX 6750 XT", 12 << 30, False,
-            "vulkan:00112233445566778899aabbccddeeff", 0,
-        )
-        with mock.patch.object(hardware, "graphics_devices", return_value=(device,)):
-            window = self.window(self.config(local_device="cpu", local_gpu=False))
+        window = self.window(self.config(local_device="cpu", local_gpu=False))
         self.assertIn("Selected processing: Processor (CPU)",
                       window.local_whisper.machine_label.text())
         window.local_device.setCurrentIndex(0)

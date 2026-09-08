@@ -2424,7 +2424,8 @@ class SettingsWindow(QDialog):
         self._select_data(self.local_device, processing_device)
         self._processing_device_changed()
         self.local_preload.setChecked(conf["local_preload"])
-        self.local_threads.setValue(int(conf["local_threads"]))
+        saved_threads = cfg._local_thread_count(conf["local_threads"])
+        self.local_threads.setValue(min(saved_threads, self.local_threads.maximum()))
         self._local_threads_changed = False
         self.local_threads.valueChanged.connect(self._local_threads_was_changed)
         # A deliberate manual override must not disappear behind a disclosure.
