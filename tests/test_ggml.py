@@ -1499,16 +1499,21 @@ class Arguments(Local):
 
     def setUp(self):
         super().setUp()
-        clean_environment = os.environ.copy()
-        for name in (
+        names = (
             "GGML_VK_VISIBLE_DEVICES", "GGML_BACKEND_PATH", "LD_PRELOAD",
             "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
-        ):
-            clean_environment.pop(name, None)
-        environment = mock.patch.dict(os.environ, clean_environment, clear=True)
-        environment.start()
-        self.addCleanup(environment.stop)
+        )
+        original = {name: os.environ[name] for name in names if name in os.environ}
+        for name in names:
+            os.environ.pop(name, None)
+
+        def restore_environment():
+            for name in names:
+                os.environ.pop(name, None)
+            os.environ.update(original)
+
+        self.addCleanup(restore_environment)
         self.binary = self.path("whisper-server")
         self.binary.write_text("#!/bin/sh\n")
         self.binary.chmod(0o755)
@@ -1564,8 +1569,11 @@ ggml_vulkan: 0 = Intel UHD Graphics (Mesa Intel) | uma: 1\nggml_vulkan: 0 = NVID
 
     def test_managed_probe_and_launch_do_not_search_inherited_cwd(self):
         # Relative inputs must keep their original meaning after child chdir.
-        binary = os.path.relpath(self.binary)
-        model = os.path.relpath(self.path("relative-model.bin"))
+        original_cwd = os.getcwd()
+        self.addCleanup(os.chdir, original_cwd)
+        os.chdir(self.binary.parent)
+        binary = self.binary.name
+        model = self.path("relative-model.bin").name
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         settings = {"binary": binary, "model": model, "gpu": True,
                     "threads": 0, "device": "auto"}

@@ -708,7 +708,8 @@ class ReadyToRun(DikteTest):
         conf = self.config(local_model="ggml-base.bin", local_threads=4,
                            local_gpu=False, local_llm_model="gemma.gguf",
                            local_llm_context=4096)
-        conf.apply_local()
+        with mock.patch.object(hardware, "cpu_threads", return_value=8):
+            conf.apply_local()
         self.addCleanup(ggml.whisper.configure, model="", threads=0, gpu=True)
         self.assertEqual(ggml.whisper.settings()["model"], "ggml-base.bin")
         self.assertEqual(ggml.whisper.settings()["threads"], 4)
