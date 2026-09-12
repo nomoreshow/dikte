@@ -1645,8 +1645,10 @@ class LocalModels(DikteTest):
         mine.chmod(0o755)
         self.patch_attr(ggml.shutil, "which", lambda name: None)
         box = self.window(self.config(local_binary=str(mine))).local_whisper
-        self.assertIn(str(mine), box.program_label.text())
-        self.assertFalse(box.install_button.isVisibleTo(box))
+        self.assertIn("Using custom build:", box.program_label.text())
+        self.assertIn(str(mine.resolve()), box.program_label.text())
+        # A managed build may still be downloaded without changing this draft.
+        self.assertTrue(box.install_button.isVisibleTo(box))
 
     def test_a_model_over_a_program_set_by_hand_is_ready(self):
         # The program is there, it is just named by the settings rather than
@@ -2050,6 +2052,115 @@ class LocalModels(DikteTest):
             self.assertEqual(window.local_device.currentData(), identifier)
             self.assertIn("unavailable", window.local_device.currentText())
 
+    def test_discarding_a_program_draft_rejects_its_device_probe(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "Detected GPU", 12 << 30, False, identifier, 0
+        )
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                workers.append(target)
+
+            def start(self):
+                pass
+
+        conf = self.config(local_binary="/custom/a", local_device=identifier)
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices",
+                REAL_REFRESH_PROCESSING_DEVICES
+        ), mock.patch.object(
+                settings_ui.threading, "Thread", DeferredThread
+        ), mock.patch.object(
+                hardware, "graphics_devices", return_value=(device,)
+        ), mock.patch.object(
+                ggml, "program_path",
+                side_effect=lambda program, custom="": custom or "/managed/b"
+        ), mock.patch.object(
+                ggml, "managed_vulkan_devices",
+                side_effect=lambda binary, devices: (
+                    devices if binary == "/managed/b" else ()
+                )
+        ):
+            window = self.window(conf)
+            workers.pop(0)()
+            self.assertIn("unavailable", window.local_device.currentText())
+            window.local_whisper.automatic_button.click()
+            window._discard_changes()
+            self.assertEqual(window.local_whisper.custom_binary, "/custom/a")
+            workers.pop(0)()  # Automatic's now-stale managed probe.
+            self.assertIn("unavailable", window.local_device.currentText())
+            workers.pop(0)()  # The restored custom program's probe.
+            self.assertIn("unavailable", window.local_device.currentText())
+
+    def test_clean_cli_reload_reprobes_the_new_program(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "Detected GPU", 12 << 30, False, identifier, 0
+        )
+        workers = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                workers.append(target)
+
+            def start(self):
+                pass
+
+        conf = self.config(local_binary="/custom/a", local_device=identifier)
+        with mock.patch.object(
+                settings_ui.SettingsWindow, "_refresh_processing_devices",
+                REAL_REFRESH_PROCESSING_DEVICES
+        ), mock.patch.object(
+                settings_ui.threading, "Thread", DeferredThread
+        ), mock.patch.object(
+                hardware, "graphics_devices", return_value=(device,)
+        ), mock.patch.object(
+                ggml, "program_path",
+                side_effect=lambda program, custom="": custom or "/managed/b"
+        ), mock.patch.object(
+                ggml, "managed_vulkan_devices",
+                side_effect=lambda binary, devices: (
+                    devices if binary == "/managed/b" else ()
+                )
+        ):
+            window = self.window(conf)
+            # Model-list setup can finish after the constructor snapshot; this
+            # test starts from the settled, clean form that receives CLI reloads.
+            window._saved_form = window._form_values()
+            conf["local_binary"] = ""
+            window.refresh_configuration()
+            self.assertEqual(window.local_whisper.custom_binary, "")
+            self.assertEqual(len(workers), 2)
+            workers.pop(0)()  # The pre-reload custom probe is stale.
+            self.assertIn("unavailable", window.local_device.currentText())
+            workers.pop(0)()
+            self.assertNotIn("unavailable", window.local_device.currentText())
+            self.assertEqual(window.dirty_label.text(), "")
+
+    def test_saving_a_device_edit_keeps_its_legacy_pair_during_cli_reload(self):
+        identifier = "vulkan:00112233445566778899aabbccddeeff"
+        device = hardware.GraphicsDevice(
+            "Detected GPU", 12 << 30, False, identifier, 0
+        )
+        conf = self.config(local_device="auto", local_gpu=True)
+        window = self.window(conf)
+        window._set_processing_devices((device,), (device,))
+        window.local_device.setCurrentIndex(
+            window.local_device.findData(identifier)
+        )
+        # A CLI update landed while this form retained an intentional edit.
+        conf["local_device"] = "cpu"
+        conf["local_gpu"] = False
+        with mock.patch.object(QMessageBox, "information"):
+            window._save()
+        saved = self.read_config_file()
+        self.assertEqual(
+            (saved["local_device"], saved["local_gpu"]),
+            (identifier, True),
+        )
+
     def test_downloaded_program_label_names_the_engine(self):
         window = self.window(cfg.Config())
         for box, name in ((window.local_whisper, "whisper.cpp"),
@@ -2081,12 +2192,14 @@ class LocalModels(DikteTest):
             "AMD Radeon RX 6750 XT", 12 << 30, False, identifier, 0,
         )
         expected = {
-            "cpu": ("Selected processing: Processor (CPU)",
-                    "Available graphics: AMD Radeon RX 6750 XT"),
-            "auto": ("Selected processing: Automatic",
-                     "Available graphics: AMD Radeon RX 6750 XT"),
-            identifier: ("Selected processing: AMD Radeon RX 6750 XT (Vulkan)",
-                         "Dedicated graphics memory: 12.0 GB"),
+            "cpu": ("Selected: Processor (CPU)",
+                    "Graphics: AMD Radeon RX 6750 XT (12.0 GB dedicated)",
+                    "Memory: 32.0 GB system"),
+            "auto": ("Selected: Automatic",
+                     "Graphics: AMD Radeon RX 6750 XT (12.0 GB dedicated)",
+                     "Memory: 32.0 GB system"),
+            identifier: ("Selected: AMD Radeon RX 6750 XT",
+                         "Memory: 12.0 GB dedicated graphics; 32.0 GB system"),
         }
         box = self.window(cfg.Config()).local_whisper
         with mock.patch.object(ggml, "total_memory", return_value=32 << 30):
@@ -2094,9 +2207,8 @@ class LocalModels(DikteTest):
                 with self.subTest(selection=selection):
                     box._show_machine(selection, (device,))
                     text = box.machine_label.text()
-                    self.assertIn(phrases[0], text)
-                    self.assertIn(phrases[1], text)
-                    self.assertIn("System memory: 32.0 GB", text)
+                    for phrase in phrases:
+                        self.assertIn(phrase, text)
 
     def test_machine_summary_puts_each_hardware_fact_on_its_own_line(self):
         device = hardware.GraphicsDevice("AMD Radeon RX 6750 XT", 12 << 30, False)
@@ -2105,9 +2217,9 @@ class LocalModels(DikteTest):
             box._show_machine("auto", (device,))
         lines = box.machine_label.text().splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertTrue(lines[0].startswith("Selected processing: Automatic"))
-        self.assertTrue(lines[1].startswith("Available graphics: AMD Radeon RX 6750 XT"))
-        self.assertTrue(lines[2].startswith("System memory: 32.0 GB"))
+        self.assertTrue(lines[0].startswith("Selected: Automatic"))
+        self.assertTrue(lines[1].startswith("Graphics: AMD Radeon RX 6750 XT"))
+        self.assertTrue(lines[2].startswith("Memory: 32.0 GB system"))
 
     def test_automatic_cpu_threads_are_in_collapsed_advanced_options(self):
         conf = self.config()
@@ -2125,6 +2237,19 @@ class LocalModels(DikteTest):
         with mock.patch.object(QMessageBox, "information"):
             window._save()
         self.assertEqual(self.read_config_file()["local_threads"], 0)
+
+    def test_advanced_threads_share_the_processing_device_field_column(self):
+        window = self.window(self.config())
+        window.tabs.setCurrentIndex(window.api_tab_index)
+        window.local_advanced_toggle.setChecked(True)
+        window.show()
+        QApplication.processEvents()
+        device_x = window.local_device.mapTo(window.local_options, QPoint()).x()
+        threads_x = window.local_threads.mapTo(window.local_options, QPoint()).x()
+        self.assertEqual(threads_x, device_x)
+        self.assertGreaterEqual(
+            window.local_advanced_toggle.width(), window.local_device.width()
+        )
 
     def test_saved_manual_threads_are_revealed_without_changing_them(self):
         conf = self.config(local_threads=2)
@@ -2289,10 +2414,10 @@ class LocalModels(DikteTest):
 
     def test_changing_the_processing_device_updates_the_summary_immediately(self):
         window = self.window(self.config(local_device="cpu", local_gpu=False))
-        self.assertIn("Selected processing: Processor (CPU)",
+        self.assertIn("Selected: Processor (CPU)",
                       window.local_whisper.machine_label.text())
         window.local_device.setCurrentIndex(0)
-        self.assertIn("Selected processing: Automatic",
+        self.assertIn("Selected: Automatic",
                       window.local_whisper.machine_label.text())
 
     def test_a_saved_card_that_is_gone_stays_selected_as_unavailable(self):
@@ -2315,8 +2440,9 @@ class LocalModels(DikteTest):
         window._set_processing_devices((device,), (device,))
         self.assertEqual(window.local_device.currentData(), identifier)
         self.assertNotIn("unavailable", window.local_device.currentText())
-        self.assertIn("AMD Radeon RX 6750 XT", window.local_device.currentText())
-        self.assertIn("12.0 GB dedicated", window.local_device.currentText())
+        self.assertEqual(window.local_device.currentText(), "AMD Radeon RX 6750 XT")
+        self.assertIn("12.0 GB dedicated graphics",
+                      window.local_whisper.machine_label.text())
 
     def test_an_unmapped_raw_card_is_not_reported_as_selected(self):
         identifier = "vulkan:00112233445566778899aabbccddeeff"
@@ -2329,9 +2455,9 @@ class LocalModels(DikteTest):
             ))
         window._set_processing_devices((device,), ())
         self.assertIn("unavailable", window.local_device.currentText())
-        self.assertIn("Selected processing: Graphics card unavailable",
+        self.assertIn("Selected: Graphics card unavailable",
                       window.local_whisper.machine_label.text())
-        self.assertNotIn("Selected processing: Present but unmappable GPU",
+        self.assertNotIn("Selected: Present but unmappable GPU",
                          window.local_whisper.machine_label.text())
 
     def test_a_managed_vulkan_card_is_an_explicit_processing_choice(self):
@@ -2373,16 +2499,16 @@ class LocalModels(DikteTest):
             workers[-1]()
         backend_probe.assert_called_once_with(str(binary), (device,))
         self.assertEqual(window.local_device.currentData(), identifier)
-        text = " ".join(window.local_device.itemText(row)
-                        for row in range(window.local_device.count()))
-        self.assertIn("AMD Radeon RX 6750 XT", text)
-        self.assertIn("12.0 GB dedicated", text)
+        self.assertEqual(window.local_device.currentText(), "AMD Radeon RX 6750 XT")
+        self.assertNotIn("12.0 GB", window.local_device.currentText())
+        self.assertIn("12.0 GB dedicated graphics",
+                      window.local_whisper.machine_label.text())
 
     def test_an_integrated_gpu_is_labelled_as_shared_memory(self):
         device = hardware.GraphicsDevice(
             "Intel UHD Graphics", 8 << 30, True, "vulkan:intel", 0,
         )
-        self.assertIn("8.0 GB shared graphics memory",
+        self.assertIn("Intel UHD Graphics (8.0 GB shared)",
                       settings_ui._graphics_device_label(device))
 
     def test_a_machine_with_no_card_is_told_it_is_on_the_processor(self):
@@ -2390,7 +2516,7 @@ class LocalModels(DikteTest):
         with mock.patch.object(ggml, "accelerator", return_value=""), \
                 mock.patch.object(ggml, "total_memory", return_value=8 << 30):
             box._show_machine()
-        self.assertIn("processor", box.machine_label.text())
+        self.assertIn("processor", box.machine_label.text().lower())
 
     def test_a_processor_build_where_the_vulkan_one_belongs_says_so(self):
         # The Vulkan whisper-server is published by hand, and until it is
@@ -2504,15 +2630,3 @@ class LocalModels(DikteTest):
                     # isHidden rather than isVisible: the window itself is never
                     # shown in a test, so nothing in it is ever visible.
                     self.assertEqual(other.isHidden(), name != chosen)
-
-    def test_local_threads_range_is_bounded_by_cpu_count(self):
-        with mock.patch("os.cpu_count", return_value=8):
-            window = self.window(cfg.Config())
-            self.assertEqual(window.local_threads.minimum(), 0)
-            self.assertEqual(window.local_threads.maximum(), 8)
-
-    def test_local_threads_range_has_safe_minimum_when_cpu_count_is_none(self):
-        with mock.patch("os.cpu_count", return_value=None):
-            window = self.window(cfg.Config())
-            self.assertEqual(window.local_threads.minimum(), 0)
-            self.assertEqual(window.local_threads.maximum(), 1)

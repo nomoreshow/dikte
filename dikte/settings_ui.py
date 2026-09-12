@@ -49,7 +49,7 @@ def _graphics_device_label(device):
     if not device.memory or device.shared is None:
         return device.name
     kind = t("shared") if device.shared else t("dedicated")
-    return t("{name} — {size} {kind} graphics memory",
+    return t("{name} ({size} {kind})",
              name=device.name, size=ggml.human_size(device.memory), kind=kind)
 
 
@@ -499,6 +499,7 @@ class LocalModelBox(QGroupBox):
         where = ggml.accelerator()
         memory = ggml.total_memory()
         parts = []
+        memory_parts = []
         selectable = devices if selectable is None else selectable
         chosen = next(
             (device for device in selectable
@@ -506,33 +507,33 @@ class LocalModelBox(QGroupBox):
             None,
         )
         if selection == "cpu":
-            parts.append(t("Selected processing: Processor (CPU)."))
+            parts.append(t("Selected: Processor (CPU)."))
         elif selection == "auto":
-            parts.append(t("Selected processing: Automatic (whisper.cpp default)."))
+            parts.append(t("Selected: Automatic."))
         elif selection:
             if chosen is None:
-                parts.append(t("Selected processing: Graphics card unavailable."))
+                parts.append(t("Selected: Graphics card unavailable."))
             else:
-                parts.append(t("Selected processing: {name} (Vulkan).",
-                               name=chosen.name))
+                parts.append(t("Selected: {name}.", name=chosen.name))
                 if chosen.memory and chosen.shared is not None:
-                    label = (t("Shared graphics memory") if chosen.shared else
-                             t("Dedicated graphics memory"))
-                    parts.append(t("{label}: {size}.", label=label,
-                                   size=ggml.human_size(chosen.memory)))
+                    kind = t("shared") if chosen.shared else t("dedicated")
+                    memory_parts.append(t("{size} {kind} graphics",
+                                          size=ggml.human_size(chosen.memory),
+                                          kind=kind))
         if selection in ("cpu", "auto"):
             if devices:
-                parts.append(t("Available graphics: {devices}.", devices="; ".join(
+                parts.append(t("Graphics: {devices}.", devices="; ".join(
                     _graphics_device_label(device) for device in devices
                 )))
             elif where:
-                parts.append(t("Available graphics interface: {name}.", name=where))
+                parts.append(t("Graphics: {name}.", name=where))
         elif selection is None:
-            parts.append(t("Available graphics interface: {name}.", name=where) if where
-                         else t("No graphics interface found, so processing is "
-                                "available on the processor."))
+            parts.append(t("Graphics: {name}.", name=where) if where
+                         else t("Graphics: Processor only."))
         if memory:
-            parts.append(t("System memory: {size}.", size=ggml.human_size(memory)))
+            memory_parts.append(t("{size} system", size=ggml.human_size(memory)))
+        if memory_parts:
+            parts.append(t("Memory: {memory}.", memory="; ".join(memory_parts)))
         self.machine_label.setText("\n".join(parts))
 
     # ---- the lists -------------------------------------------------------
@@ -1080,7 +1081,10 @@ class SettingsWindow(QDialog):
                 box.toggled.connect(self._show_dirty)
             else:
                 box.valueChanged.connect(self._show_dirty)
+        self.local_threads.valueChanged.connect(self._local_threads_was_changed)
         self.local_whisper.program_changed.connect(self._refresh_processing_devices)
+        self.local_whisper.program_changed.connect(self._show_dirty)
+        self.local_llm.program_changed.connect(self._show_dirty)
         self._refresh_processing_devices()
         self._load_codex_models()
         self._load_agy_models()
@@ -1122,6 +1126,10 @@ class SettingsWindow(QDialog):
         if provider in models:
             models[provider] = self.transcribe_model.currentText().strip()
         values.append(models)
+        values.extend((
+            self.local_whisper.custom_binary,
+            self.local_llm.custom_binary,
+        ))
         return values
 
     def refresh_configuration(self):
@@ -1483,22 +1491,21 @@ class SettingsWindow(QDialog):
             self.local_threads.fontMetrics()
             .horizontalAdvance(t("Automatic")) + 56)
         self.local_options = QWidget()
-        options_form = QFormLayout(self.local_options)
+        options_form = self.local_options_form = QFormLayout(self.local_options)
         options_form.setContentsMargins(0, 0, 0, 0)
         options_form.addRow(t("Processing device"), self.local_device)
         options_form.addRow("", self.local_preload)
         self.local_advanced_toggle = QToolButton()
+        self.local_advanced_toggle.setObjectName("disclosure")
         self.local_advanced_toggle.setText(t("Advanced"))
         self.local_advanced_toggle.setCheckable(True)
         self.local_advanced_toggle.setAutoRaise(True)
+        self.local_advanced_toggle.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.local_advanced_toggle.setToolButtonStyle(
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.local_advanced = QWidget()
-        advanced_form = QFormLayout(self.local_advanced)
-        advanced_form.setContentsMargins(0, 0, 0, 0)
-        advanced_form.addRow(t("CPU threads"), self.local_threads)
         options_form.addRow(self.local_advanced_toggle)
-        options_form.addRow(self.local_advanced)
+        options_form.addRow(t("CPU threads"), self.local_threads)
         self.local_advanced_toggle.toggled.connect(self._toggle_local_advanced)
         self._toggle_local_advanced(False)
         stt_form.addRow(self.local_options)
@@ -2414,6 +2421,8 @@ class SettingsWindow(QDialog):
         self._select_data(self.transcribe_provider, conf["transcribe_provider"])
         self._provider_changed()  # selecting index 0 fires no signal
         self.file_model.setCurrentText(conf["openrouter_file_model"])
+        binary_changed = self.local_whisper.custom_binary != conf["local_binary"]
+        self.local_whisper.custom_binary = conf["local_binary"]
         processing_device = conf["local_device"]
         if processing_device not in ("auto", "cpu") \
                 and self.local_device.findData(processing_device) < 0:
@@ -2427,11 +2436,14 @@ class SettingsWindow(QDialog):
         saved_threads = cfg._local_thread_count(conf["local_threads"])
         self.local_threads.setValue(min(saved_threads, self.local_threads.maximum()))
         self._local_threads_changed = False
-        self.local_threads.valueChanged.connect(self._local_threads_was_changed)
         # A deliberate manual override must not disappear behind a disclosure.
         self.local_advanced_toggle.setChecked(self.local_threads.value() != 0)
-        self.local_whisper.custom_binary = conf["local_binary"]
         self.local_whisper.load(conf["local_model"])
+        # Initial construction probes after signals are connected. Every later
+        # reload must invalidate the old draft's probe as soon as it restores a
+        # different executable.
+        if binary_changed and hasattr(self, "_saved_form"):
+            self._refresh_processing_devices()
 
         self.cleanup_enabled.setChecked(conf["cleanup_enabled"])
         self.cleanup_model.setCurrentText(conf["cleanup_model"])
@@ -2685,7 +2697,12 @@ class SettingsWindow(QDialog):
         conf["history_limit"] = self.history_limit.value()
         # A retained form may predate a CLI reload. Only its edits take priority;
         # unchanged fields keep the current runtime value.
+        device_edited = (
+            conf["local_device"] != self._loaded_config.get("local_device")
+        )
         for key, value in before.items():
+            if device_edited and key in ("local_device", "local_gpu"):
+                continue
             if conf.data.get(key) == self._loaded_config.get(key):
                 conf.data[key] = value
         try:
@@ -2744,7 +2761,7 @@ class SettingsWindow(QDialog):
     # ---- api helpers -----------------------------------------------------
 
     def _toggle_local_advanced(self, expanded):
-        self.local_advanced.setVisible(expanded)
+        self.local_options_form.setRowVisible(self.local_threads, expanded)
         self.local_advanced_toggle.setArrowType(
             Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
 
@@ -2780,7 +2797,7 @@ class SettingsWindow(QDialog):
         for device in managed:
             if device.identifier:
                 self.local_device.addItem(
-                    _graphics_device_label(device), device.identifier
+                    device.name, device.identifier
                 )
         if current not in ("auto", "cpu") \
                 and self.local_device.findData(current) < 0:
