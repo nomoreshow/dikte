@@ -1,0 +1,107 @@
+name: Node 24 artifact round trip
+
+on:
+  push:
+    branches: [test/node24-artifact-roundtrip]
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    if: github.repository == 'nomoreshow/dikte'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create nested fixtures and checksums
+        run: |
+          mkdir -p payload/alpha/nested payload/beta/deeper
+          printf 'alpha first\n' > payload/alpha/nested/first.txt
+          printf 'alpha spaced\n' > 'payload/alpha/nested/file with spaces.txt'
+          printf '\x00\x01\x02beta\n' > payload/beta/deeper/second.bin
+          (cd payload && sha256sum \
+            alpha/nested/first.txt \
+            'alpha/nested/file with spaces.txt' > alpha.sha256)
+          (cd payload && sha256sum beta/deeper/second.bin > beta.sha256)
+
+      - name: Upload alpha
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roundtrip-alpha
+          path: |
+            payload/alpha
+            payload/alpha.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload beta
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roundtrip-beta
+          path: |
+            payload/beta
+            payload/beta.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  download-merged:
+    needs: upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and merge both artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: roundtrip-*
+          path: received
+          merge-multiple: true
+
+      - name: Verify merged paths and hashes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          expected = {
+              'alpha.sha256',
+              'alpha/nested/file with spaces.txt',
+              'alpha/nested/first.txt',
+              'beta.sha256',
+              'beta/deeper/second.bin',
+          }
+          actual = {
+              str(path.relative_to('received'))
+              for path in Path('received').rglob('*') if path.is_file()
+          }
+          if actual != expected:
+              raise SystemExit(f'paths changed: expected={sorted(expected)!r}, actual={sorted(actual)!r}')
+          PY
+          (cd received && sha256sum --check alpha.sha256 beta.sha256)
+
+  download-named:
+    needs: upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download alpha by name
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: roundtrip-alpha
+          path: received
+
+      - name: Verify named paths and hashes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          expected = {
+              'alpha.sha256',
+              'alpha/nested/file with spaces.txt',
+              'alpha/nested/first.txt',
+          }
+          actual = {
+              str(path.relative_to('received'))
+              for path in Path('received').rglob('*') if path.is_file()
+          }
+          if actual != expected:
+              raise SystemExit(f'paths changed: expected={sorted(expected)!r}, actual={sorted(actual)!r}')
+          PY
+          (cd received && sha256sum --check alpha.sha256)
